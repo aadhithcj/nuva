@@ -55,11 +55,15 @@ impl SettingsWindow {
             let hinst = GetModuleHandleW(None).ok()?;
             static REG: std::sync::Once = std::sync::Once::new();
             REG.call_once(|| {
+                let icon_big = crate::tray::app_icon(false);
+                let icon_sm = crate::tray::app_icon(true);
                 let wc = WNDCLASSEXW {
                     cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                     style: CS_HREDRAW | CS_VREDRAW,
                     lpfnWndProc: Some(wndproc),
                     hInstance: hinst.into(),
+                    hIcon: icon_big,
+                    hIconSm: icon_sm,
                     hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                     lpszClassName: w!("NuvaSettings"),
                     ..Default::default()
@@ -82,6 +86,10 @@ impl SettingsWindow {
             )
             .map_err(|e| crate::store::debug(&format!("settings CreateWindowExW failed: {e}")))
             .ok()?;
+            let icon_big = crate::tray::app_icon(false);
+            let icon_sm = crate::tray::app_icon(true);
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(icon_big.0 as _));
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as _), LPARAM(icon_sm.0 as _));
             let dark: BOOL = true.into();
             let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(20), &dark as *const _ as *const _, 4);
             let scale = GetDpiForWindow(hwnd) as f32 / 96.0;

@@ -59,6 +59,7 @@ $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut($shortcut)
 $lnk.TargetPath = $exe
 $lnk.WorkingDirectory = $dest
+$lnk.IconLocation = "$exe,0"
 $lnk.Description = 'A living notch for Windows'
 $lnk.Save()
 
@@ -72,5 +73,18 @@ if ($NoStartup) {
     Set-ItemProperty -Path $runKey -Name 'Nuva' -Value "`"$exe`""
 }
 
-Start-Process $exe
+# Invalidate Windows Explorer icon cache so updated icons appear immediately
+try {
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class ShellCache {
+        [DllImport("shell32.dll")]
+        public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    }
+"@ -ErrorAction SilentlyContinue
+    [ShellCache]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+} catch {}
+
+explorer.exe $exe
 Write-Host "Installed to $dest and launched. Right-click the tray icon for settings."

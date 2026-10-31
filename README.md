@@ -9,6 +9,23 @@ Rebuilt from scratch from a feature map of the closed-source Nusa 1.1.0
 
 ## Install
 
+### Standalone Setup (Recommended)
+
+Run `NuvaSetup.exe` or build it yourself:
+
+```powershell
+.\build-installer.ps1          # builds release, embeds icon & version, creates NuvaSetup.exe
+```
+
+The installer packages Nuva into a compact (~420 KB) installer that:
+- Installs to `%LOCALAPPDATA%\Programs\Nuva` (no admin rights required)
+- Automatically closes any running instances
+- Adds Start Menu and optional Desktop shortcuts
+- Configures autostart with Windows (HKCU Run)
+- Registers with Windows "Installed apps" with full uninstaller support
+
+### Developer Install Script
+
 ```powershell
 .\install.ps1              # builds if needed, installs to %LOCALAPPDATA%\Programs\Nuva, autostarts, launches
 .\install.ps1 -NoStartup   # same without autostart

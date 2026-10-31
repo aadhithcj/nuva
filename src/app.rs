@@ -291,6 +291,8 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
+            hIcon: crate::tray::app_icon(false),
+            hIconSm: crate::tray::app_icon(true),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: w!("NuvaNotchWindow"),
             ..Default::default()

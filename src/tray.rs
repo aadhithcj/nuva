@@ -19,6 +19,79 @@ pub const ID_SIZE_BASE: usize = 200; // + index into SIZES
 pub const ID_DISPLAY_BASE: usize = 300; // + display value
 pub const SIZES: [u32; 5] = [0, 100, 115, 130, 150];
 
+const ICO_BYTES: &[u8] = include_bytes!("../assets/app.ico");
+
+/// Extract an HICON from the embedded .ico file matching the desired size.
+pub fn app_icon(small: bool) -> HICON {
+    unsafe {
+        let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
+        let target_size = if small { 16 } else { 32 };
+        // 1. Try loading from PE resource table (e.g. set by rcedit)
+        if let Ok(h) = LoadImageW(
+            hinst,
+            windows::core::PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            target_size,
+            target_size,
+            LR_DEFAULTCOLOR,
+        ) {
+            if !h.is_invalid() {
+                return HICON(h.0);
+            }
+        }
+        // 2. Parse the embedded ICO_BYTES directly
+        if let Some(h) = icon_from_ico_bytes(target_size as u8) {
+            return h;
+        }
+        // 3. Fallback to procedural icon
+        make_icon()
+    }
+}
+
+fn icon_from_ico_bytes(target_size: u8) -> Option<HICON> {
+    if ICO_BYTES.len() < 6 { return None; }
+    let count = u16::from_le_bytes([ICO_BYTES[4], ICO_BYTES[5]]) as usize;
+    let mut best: Option<(usize, usize)> = None;
+    for i in 0..count {
+        let base = 6 + i * 16;
+        if base + 16 > ICO_BYTES.len() { break; }
+        let w = ICO_BYTES[base];
+        let bytes_in_res = u32::from_le_bytes([
+            ICO_BYTES[base + 8],
+            ICO_BYTES[base + 9],
+            ICO_BYTES[base + 10],
+            ICO_BYTES[base + 11],
+        ]) as usize;
+        let image_offset = u32::from_le_bytes([
+            ICO_BYTES[base + 12],
+            ICO_BYTES[base + 13],
+            ICO_BYTES[base + 14],
+            ICO_BYTES[base + 15],
+        ]) as usize;
+        if w == target_size {
+            best = Some((image_offset, bytes_in_res));
+            break;
+        }
+        if best.is_none() && (w == 32 || w == 0) {
+            best = Some((image_offset, bytes_in_res));
+        }
+    }
+    let (offset, len) = best?;
+    if offset + len > ICO_BYTES.len() { return None; }
+    let slice = &ICO_BYTES[offset..offset + len];
+    unsafe {
+        let res = CreateIconFromResourceEx(
+            slice,
+            true,
+            0x00030000,
+            target_size as i32,
+            target_size as i32,
+            LR_DEFAULTCOLOR,
+        );
+        res.ok()
+    }
+}
+
 /// Draw a 32x32 icon: a screen outline with a notch at the top.
 fn make_icon() -> HICON {
     const S: i32 = 32;
@@ -72,7 +145,7 @@ pub fn add(hwnd: HWND) {
     let mut d = data(hwnd);
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     d.uCallbackMessage = WM_APP_TRAY;
-    d.hIcon = make_icon();
+    d.hIcon = app_icon(true);
     for (i, c) in "Nuva".encode_utf16().enumerate() {
         d.szTip[i] = c;
     }
