@@ -1,0 +1,42 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.bk
+
+# Executables and compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.pdb
+*.obj
+*.o
+
+# Upstream installers and binaries
+NusaSetup.exe
+NuvaSetup.exe
+
+# Logs, temporary files and crash dumps
+*.log
+*.tmp
+*.dmp
+
+# OS-generated files
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.env.*
