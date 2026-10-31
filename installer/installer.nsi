@@ -1,6 +1,7 @@
 ; ==============================================================================
 ; Nuva Installer Script (NSIS)
-; Modern, lightweight, per-user setup for Nuva - A living notch for Windows
+; Modern, lightweight, per-user setup bundling Nuva
+; Compiles to: NusaSetup.exe
 ; ==============================================================================
 
 Unicode True
@@ -19,7 +20,7 @@ SetCompressor /SOLID lzma
 ; Setup Information
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} ${PRODUCT_VERSION} Setup"
-OutFile "NuvaSetup.exe"
+OutFile "..\NusaSetup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Nuva"
 InstallDirRegKey HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel user
@@ -39,8 +40,8 @@ VIAddVersionKey "LegalCopyright" "Copyright (C) 2026 ${PRODUCT_PUBLISHER}"
 !include "FileFunc.nsh"
 
 ; Interface settings
-!define MUI_ICON "assets\app.ico"
-!define MUI_UNICON "assets\app.ico"
+!define MUI_ICON "..\assets\app.ico"
+!define MUI_UNICON "..\assets\app.ico"
 !define MUI_ABORTWARNING
 
 ; Welcome page
@@ -99,7 +100,7 @@ Section "Nuva Core Application (required)" SecCore
     Call StopNuva
 
     SetOutPath "$INSTDIR"
-    File "target\release\nuva.exe"
+    File "..\target\release\nuva.exe"
 
     ; Create uninstaller
     WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -187,3 +188,4 @@ Section "Uninstall"
     ; Refresh icon cache
     System::Call 'shell32.dll::SHChangeNotify(i, i, p, p) v (0x08000000, 0, 0, 0)'
 SectionEnd
+

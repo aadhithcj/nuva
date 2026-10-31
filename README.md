@@ -9,30 +9,16 @@ Rebuilt from scratch from a feature map of the closed-source Nusa 1.1.0
 
 ## Install
 
-### Standalone Setup (Recommended)
+Run `NusaSetup.exe` to install Nuva.
 
-Run `NuvaSetup.exe` or build it yourself:
-
-```powershell
-.\build-installer.ps1          # builds release, embeds icon & version, creates NuvaSetup.exe
-```
-
-The installer packages Nuva into a compact (~420 KB) installer that:
-- Installs to `%LOCALAPPDATA%\Programs\Nuva` (no admin rights required)
-- Automatically closes any running instances
-- Adds Start Menu and optional Desktop shortcuts
-- Configures autostart with Windows (HKCU Run)
+The bundled setup:
+- Installs to `%LOCALAPPDATA%\Programs\Nuva` (no administrator privileges required)
+- Automatically closes any running instances before updating
+- Creates Start Menu and optional Desktop shortcuts
+- Configures autostart with Windows (`HKCU\...\Run`)
 - Registers with Windows "Installed apps" with full uninstaller support
 
-### Developer Install Script
-
-```powershell
-.\install.ps1              # builds if needed, installs to %LOCALAPPDATA%\Programs\Nuva, autostarts, launches
-.\install.ps1 -NoStartup   # same without autostart
-.\install.ps1 -Uninstall   # remove (add -RemoveData to delete your data too)
-```
-
-Requires the Rust GNU toolchain to build (`scoop install rustup-gnu`, then `rustup default stable-x86_64-pc-windows-gnu`).
+Requires the Rust GNU toolchain if building from source (`scoop install rustup-gnu`, then `rustup default stable-x86_64-pc-windows-gnu`).
 
 ## Features
 
