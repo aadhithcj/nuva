@@ -20,11 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const SECTIONS: [(&str, char); 10] = [
+pub const SECTIONS: [(&str, char); 11] = [
     ("General", ico::SETTINGS),
+    ("Pages", ico::CHECKLIST),
     ("Appearance", ico::ART),
     ("Music and lyrics", ico::MUSIC),
-    ("To-do & calendar", ico::CHECKLIST),
+    ("To-do & calendar", ico::CALENDAR),
     ("Pomodoro", ico::TIMER),
     ("Water", ico::DROP),
     ("Shelf & clipboard", ico::FOLDER),
@@ -378,14 +379,15 @@ fn paint(a: &mut App, sw: &mut SettingsWindow) {
     let mut f = Form { c: &mut c, x, w: cw, y };
     match sw.section {
         0 => general(a, &mut f),
-        1 => appearance(a, &mut f),
-        2 => music(a, &mut f),
-        3 => todo(a, &mut f),
-        4 => pomodoro(a, &mut f),
-        5 => water(a, &mut f),
-        6 => shelf(a, &mut f),
-        7 => hud(a, &mut f),
-        8 => notifs(a, &mut f),
+        1 => pages_section(a, &mut f),
+        2 => appearance(a, &mut f),
+        3 => music(a, &mut f),
+        4 => todo(a, &mut f),
+        5 => pomodoro(a, &mut f),
+        6 => water(a, &mut f),
+        7 => shelf(a, &mut f),
+        8 => hud(a, &mut f),
+        9 => notifs(a, &mut f),
         _ => about(&mut f),
     }
     sw.content_h = f.y + sw.scroll;
@@ -475,6 +477,8 @@ fn general(a: &mut App, f: &mut Form) {
     f.toggle("Reminder sounds", "Chimes for Pomodoro, To-do and Water", s.sound, Action::SetToggle("sound"));
     f.toggle("Hide in full screen", "Games, videos and slides that fill the screen", s.hide_fullscreen, Action::SetToggle("hide_fullscreen"));
     f.toggle("Auto-hide over windows", "Only show on top-center hover when a window is open", s.autohide_window, Action::SetToggle("autohide_window"));
+    f.toggle("Exclude from screen capture", "Hide notch during screen sharing & recording", s.exclude_capture, Action::SetToggle("exclude_capture"));
+    f.toggle("Scroll pill for volume", "Scroll up or down on the collapsed notch to change volume", s.scroll_volume, Action::SetToggle("scroll_volume"));
 
     f.group("Display");
     let mons = system::monitors();
@@ -507,6 +511,22 @@ fn general(a: &mut App, f: &mut Form) {
     }
     f.y += box_h + 16.0;
     f.toggle("Follow the main display", "Always use whichever screen is set as main", s.display == 0, Action::SetDisplay(0));
+}
+
+fn pages_section(a: &mut App, f: &mut Form) {
+    let s = a.settings.clone();
+    f.group("Active Notch Pages");
+    f.note("Choose which pages appear in the notch. Disabled pages are hidden from page dots and gestures.");
+    f.toggle("Now Playing (Music)", "Media player controls and synced lyrics", s.page_home, Action::SetToggle("page_home"));
+    f.toggle("Focus Timer", "Pomodoro with short and long breaks", s.page_timer, Action::SetToggle("page_timer"));
+    f.toggle("Water Tracker", "Water intake tracker and reminders", s.page_water, Action::SetToggle("page_water"));
+    f.toggle("To-do List", "Tasks with start and end reminders", s.page_todo, Action::SetToggle("page_todo"));
+    f.toggle("Calendar", "Month and week views with your tasks", s.page_calendar, Action::SetToggle("page_calendar"));
+    f.toggle("File Shelf", "Drop files, links and snippets", s.page_shelf, Action::SetToggle("page_shelf"));
+    f.toggle("Clipboard History", "Recent copies with pin and search", s.page_clipboard, Action::SetToggle("page_clipboard"));
+    f.toggle("Notifications", "Windows notification mirror", s.page_notifs, Action::SetToggle("page_notifs"));
+    f.toggle("System Stats", "Live CPU, GPU, RAM, disk and network graphs", s.page_stats, Action::SetToggle("page_stats"));
+    f.toggle("Calculator & Search", "Live math calculator, unit converter and app launcher", s.page_calc, Action::SetToggle("page_calc"));
 }
 
 fn appearance(a: &mut App, f: &mut Form) {
@@ -587,10 +607,16 @@ fn hud(a: &mut App, f: &mut Form) {
     f.toggle("Brightness", "Laptop screens", s.hud_brightness, Action::SetToggle("hud_brightness"));
     f.toggle("Caps Lock", "", s.hud_caps, Action::SetToggle("hud_caps"));
     f.toggle("Input language", "When you switch keyboard layout", s.hud_language, Action::SetToggle("hud_language"));
+    f.toggle("Microphone privacy & mute", "Orange dot when mic is in use; click to toggle mute", s.mic_privacy, Action::SetToggle("mic_privacy"));
+    f.toggle("Download progress", "Glow line along notch bottom during downloads", s.downloads, Action::SetToggle("downloads"));
     f.group("Popups");
     f.toggle("Battery", "Charger, low battery and fully charged", s.popup_battery, Action::SetToggle("popup_battery"));
     f.toggle("Wi-Fi", "Connected, no internet, disconnected", s.popup_wifi, Action::SetToggle("popup_wifi"));
     f.toggle("Bluetooth headset", "When earbuds or headphones connect", s.popup_bluetooth, Action::SetToggle("popup_bluetooth"));
+    f.group("Header Tools");
+    f.toggle("Color picker button", "Eyedropper icon to pick pixel color from screen", s.tool_picker, Action::SetToggle("tool_picker"));
+    f.toggle("Calculator & Search button", "Quick launcher button in the notch header", s.tool_search, Action::SetToggle("tool_search"));
+    f.toggle("Audio output switcher", "Quick button to cycle playback devices", s.tool_audio, Action::SetToggle("tool_audio"));
 }
 
 fn notifs(a: &mut App, f: &mut Form) {

@@ -149,6 +149,64 @@ impl Shelf {
         self.save();
     }
 
+    pub fn convert_image(&mut self, i: usize) -> Option<PathBuf> {
+        if i >= self.items.len() { return None; }
+        let p = &self.items[i].path;
+        let ext = p.extension()?.to_str()?.to_lowercase();
+        let target_ext = if ext == "png" { "jpg" } else { "png" };
+        let out_name = format!("{}_converted.{}", p.file_stem()?.to_str()?, target_ext);
+        let out_path = p.parent()?.join(&out_name);
+
+        let ps_cmd = format!(
+            "Add-Type -AssemblyName System.Drawing; $b = [System.Drawing.Bitmap]::FromFile('{}'); $fmt = if ('{}' -eq 'jpg') {{ [System.Drawing.Imaging.ImageFormat]::Jpeg }} else {{ [System.Drawing.Imaging.ImageFormat]::Png }}; $b.Save('{}', $fmt); $b.Dispose()",
+            p.display(), target_ext, out_path.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .status()
+            .ok()?;
+        if status.success() && out_path.exists() {
+            self.items.push(Item {
+                kind: Kind::File,
+                label: file_label(&out_path),
+                path: out_path.clone(),
+                content: String::new(),
+            });
+            self.save();
+            Some(out_path)
+        } else {
+            None
+        }
+    }
+
+    pub fn zip_item(&mut self, i: usize) -> Option<PathBuf> {
+        if i >= self.items.len() { return None; }
+        let p = &self.items[i].path;
+        let out_name = format!("{}.zip", p.file_stem()?.to_str()?);
+        let out_path = p.parent()?.join(&out_name);
+
+        let ps_cmd = format!(
+            "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+            p.display(), out_path.display()
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .status()
+            .ok()?;
+        if status.success() && out_path.exists() {
+            self.items.push(Item {
+                kind: Kind::File,
+                label: file_label(&out_path),
+                path: out_path.clone(),
+                content: String::new(),
+            });
+            self.save();
+            Some(out_path)
+        } else {
+            None
+        }
+    }
+
     pub fn open(&self, i: usize) {
         if let Some(it) = self.items.get(i) {
             let target = if it.kind == Kind::Link { HSTRING::from(it.content.as_str()) } else { HSTRING::from(it.path.as_os_str()) };

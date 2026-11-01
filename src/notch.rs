@@ -67,6 +67,7 @@ impl App {
                     Page::Clipboard => (520.0, 290.0),
                     Page::Notifs => (520.0, 290.0),
                     Page::Stats => (580.0, 216.0),
+                    Page::Calc => (460.0, 270.0),
                 };
                 (w, h, 26.0)
             }
@@ -118,6 +119,7 @@ impl App {
             } else {
                 self.eq_bars(c, a.r() - 30.0, cy);
             }
+            self.draw_pill_overlays(c, a);
             return;
         }
         if self.pomo.active(&self.settings) {
@@ -127,6 +129,12 @@ impl App {
             let label = if self.pomo.running { self.pomo.mode.label() } else { "Paused" };
             c.text(label, Rect::new(a.x + 36.0, 0.0, 100.0, a.h), 11.5, W::Medium, pal::DIM, Align::Left);
             c.text(&time::mmss(self.pomo.left()), Rect::new(a.r() - 72.0, 0.0, 60.0, a.h), 13.0, W::Semi, col, Align::Right);
+            self.draw_pill_overlays(c, a);
+            return;
+        }
+        if let Some(act) = &self.live_activity {
+            c.text(&act.title, Rect::new(a.x + 16.0, 0.0, a.w - 32.0, a.h), 12.0, W::Medium, pal::TEXT, Align::Center);
+            self.draw_pill_overlays(c, a);
             return;
         }
         match self.pet {
@@ -135,6 +143,31 @@ impl App {
                 c.text(&time::hm_short(now.minute_of_day(), self.h24), a, 12.5, W::Semi, pal::TEXT, Align::Center);
             }
             p => self.draw_mascot(c, a.cx(), cy, p),
+        }
+        self.draw_pill_overlays(c, a);
+    }
+
+    fn draw_pill_overlays(&mut self, c: &mut Canvas, a: Rect) {
+        let cy = a.cy();
+        if self.settings.mic_privacy && (self.mic_active || self.mic_muted) {
+            let mic_r = Rect::new(a.r() - 20.0, cy - 8.0, 16.0, 16.0);
+            if self.mic_muted {
+                c.icon(ico::MIC_OFF, mic_r, 10.0, pal::RED);
+            } else {
+                c.circle(mic_r.cx(), mic_r.cy(), 3.5, pal::ORANGE);
+            }
+            c.hit(mic_r.inset(-4.0, -4.0), Action::ToggleMicMute);
+        }
+        if self.settings.downloads {
+            if let Some(dl) = &self.download {
+                let frac = dl.progress.unwrap_or(0.65);
+                c.line(a.x + 10.0, a.b() - 2.0, a.x + 10.0 + (a.w - 20.0) * frac, a.b() - 2.0, pal::ACCENT, 2.0);
+            }
+        }
+        if let Some(act) = &self.live_activity {
+            if let Some(p) = act.progress {
+                c.line(a.x + 10.0, a.b() - 2.0, a.x + 10.0 + (a.w - 20.0) * p, a.b() - 2.0, pal::GREEN, 2.0);
+            }
         }
     }
 
@@ -227,11 +260,33 @@ impl App {
         // Header
         let hdr = Rect::new(a.x + 22.0, 4.0, a.w - 44.0, 26.0);
         c.icon(page.icon(), Rect::new(hdr.x, hdr.y, 16.0, hdr.h), 11.0, pal::DIM);
-        c.text(page.title(), Rect::new(hdr.x + 22.0, hdr.y, 160.0, hdr.h), 12.0, W::Semi, pal::DIM, Align::Left);
+        c.text(page.title(), Rect::new(hdr.x + 22.0, hdr.y, 130.0, hdr.h), 12.0, W::Semi, pal::DIM, Align::Left);
+
+        let mut hx = hdr.r() - 22.0;
+        c.icon_button(Rect::new(hx, hdr.y + 2.0, 22.0, 22.0), ico::SETTINGS, 10.5, Action::OpenSettings, pal::DIM);
+        if self.settings.tool_search {
+            hx -= 26.0;
+            c.icon_button(Rect::new(hx, hdr.y + 2.0, 22.0, 22.0), ico::SEARCH, 10.5, Action::OpenCommandPalette, pal::DIM);
+        }
+        if self.settings.tool_picker {
+            hx -= 26.0;
+            let picker_col = if self.picking_color { pal::ACCENT } else { pal::DIM };
+            c.icon_button(Rect::new(hx, hdr.y + 2.0, 22.0, 22.0), ico::EYEDROPPER, 10.5, Action::PickColor, picker_col);
+        }
+        if self.settings.tool_audio {
+            hx -= 26.0;
+            c.icon_button(Rect::new(hx, hdr.y + 2.0, 22.0, 22.0), ico::SPEAKER, 10.5, Action::CycleAudioDevice, pal::DIM);
+        }
+        if self.settings.mic_privacy {
+            hx -= 26.0;
+            let mic_ico = if self.mic_muted { ico::MIC_OFF } else { ico::MIC };
+            let mic_col = if self.mic_muted { pal::RED } else if self.mic_active { pal::ORANGE } else { pal::DIM };
+            c.icon_button(Rect::new(hx, hdr.y + 2.0, 22.0, 22.0), mic_ico, 10.5, Action::ToggleMicMute, mic_col);
+        }
+
         let now = time::now();
-        let right = Rect::new(hdr.r() - 140.0, hdr.y, 112.0, hdr.h);
+        let right = Rect::new(hx - 80.0, hdr.y, 70.0, hdr.h);
         c.text(&time::hm(now.minute_of_day(), self.h24), right, 12.0, W::Medium, pal::DIM, Align::Right);
-        c.icon_button(Rect::new(hdr.r() - 22.0, hdr.y + 2.0, 22.0, 22.0), ico::SETTINGS, 10.5, Action::OpenSettings, pal::DIM);
 
         let content = Rect::new(a.x + 20.0, 36.0, a.w - 40.0, a.h - 36.0 - 28.0);
         match page {
@@ -250,6 +305,7 @@ impl App {
             Page::Clipboard => self.draw_clipboard(c, content),
             Page::Notifs => self.draw_notifs(c, content),
             Page::Stats => self.draw_stats(c, content),
+            Page::Calc => self.draw_calc(c, content),
         }
         self.draw_dots(c, a, page);
     }
@@ -733,7 +789,20 @@ impl App {
             }
             c.text_wrap(&it.label, Rect::new(tile.x + 4.0, icon.b() + 6.0, tile.w - 8.0, 30.0), 10.5, W::Regular, pal::TEXT, Align::Center);
             if hov {
-                c.icon_button(Rect::new(tile.r() - 24.0, tile.y + 2.0, 22.0, 22.0), ico::CLOSE, 8.0, Action::ShelfRemove(i), pal::DIM);
+                c.icon_button(Rect::new(tile.r() - 22.0, tile.y + 2.0, 20.0, 20.0), ico::CLOSE, 8.0, Action::ShelfRemove(i), pal::DIM);
+                if it.kind == Kind::File {
+                    let mut btn_x = tile.x + 4.0;
+                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::LINK, 8.5, Action::ShelfCopyPath(i), pal::ACCENT);
+                    btn_x += 20.0;
+                    let ext = it.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp") {
+                        c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::CONVERT, 8.5, Action::ShelfConvert(i), pal::GREEN);
+                        btn_x += 20.0;
+                    }
+                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::ZIP, 8.5, Action::ShelfZip(i), pal::ACCENT);
+                    btn_x += 20.0;
+                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::FOLDER, 8.5, Action::ShelfExplore(i), pal::DIM);
+                }
             }
         }
         c.unclip();
@@ -906,5 +975,69 @@ impl App {
         c.text(&format!("↑ {}/s", stats::bytes(u)), Rect::new(t.x + 12.0, t.y + 48.0, t.w - 24.0, 18.0), 12.0, W::Regular, pal::DIM, Align::Left);
         let max = st.down.iter().cloned().fold(1024.0f64, f64::max) as f32;
         spark(c, t, st.down.iter().map(|v| *v as f32).collect(), max, pal::WATER);
+    }
+
+    fn draw_calc(&mut self, c: &mut Canvas, a: Rect) {
+        let bar = Rect::new(a.x, a.y + 2.0, a.w, 40.0);
+        c.rrect(bar, 10.0, pal::CARD);
+        c.rrect_stroke(bar, 10.0, pal::LINE, 1.0);
+
+        let has_res = self.cmd.result.is_some();
+        let query_w = if has_res { a.w - 180.0 } else { a.w - 48.0 };
+        let input_r = Rect::new(bar.x + 12.0, bar.y + 6.0, query_w, 28.0);
+
+        if self.cmd.query.is_empty() {
+            c.text("Type math (125 * 1.5), 50 km to mi, or tap buttons", input_r, 12.0, W::Regular, pal::FAINT, Align::Left);
+        } else {
+            c.text(&self.cmd.query, input_r, 15.0, W::Semi, pal::TEXT, Align::Left);
+        }
+
+        if let Some(res) = &self.cmd.result {
+            let res_r = Rect::new(bar.r() - 170.0, bar.y + 6.0, 100.0, 28.0);
+            c.text(&format!("= {}", res.title), res_r, 15.0, W::Bold, pal::ACCENT, Align::Right);
+            let btn_r = Rect::new(bar.r() - 64.0, bar.y + 7.0, 56.0, 26.0);
+            let btn_lbl = match res.kind {
+                crate::cmd::CommandKind::Copy(_) => "Copy",
+                _ => "Run",
+            };
+            c.button(btn_r, btn_lbl, Action::CommandRun, pal::ACCENT, pal::BLACK);
+        } else if !self.cmd.query.is_empty() {
+            c.icon_button(Rect::new(bar.r() - 32.0, bar.y + 8.0, 24.0, 24.0), ico::DELETE, 10.0, Action::CalcBackspace, pal::DIM);
+        }
+
+        let kp_y = bar.b() + 8.0;
+        let kp_h = a.b() - kp_y;
+        let rows = 5;
+        let cols = 5;
+        let gap = 5.0;
+        let btn_w = (a.w - (cols as f32 - 1.0) * gap) / cols as f32;
+        let btn_h = (kp_h - (rows as f32 - 1.0) * gap) / rows as f32;
+
+        let grid: [[(&str, &'static str, &str); 5]; 5] = [
+            [("C", "", "danger"), ("(", "(", "fn"), (")", ")", "fn"), ("^", "^", "op"), ("÷", " / ", "op")],
+            [("7", "7", "num"), ("8", "8", "num"), ("9", "9", "num"), ("√", "sqrt(", "fn"), ("×", " * ", "op")],
+            [("4", "4", "num"), ("5", "5", "num"), ("6", "6", "num"), ("%", "%", "fn"), ("-", " - ", "op")],
+            [("1", "1", "num"), ("2", "2", "num"), ("3", "3", "num"), ("sin", "sin(", "fn"), ("+", " + ", "op")],
+            [("0", "0", "num"), (".", ".", "num"), ("π", "pi", "fn"), ("cos", "cos(", "fn"), ("=", "", "accent")],
+        ];
+
+        for (r_idx, row) in grid.iter().enumerate() {
+            for (c_idx, (label, val, kind)) in row.iter().enumerate() {
+                let rect = Rect::new(
+                    a.x + c_idx as f32 * (btn_w + gap),
+                    kp_y + r_idx as f32 * (btn_h + gap),
+                    btn_w,
+                    btn_h,
+                );
+                let (fill, fg, act) = match *kind {
+                    "danger" => (pal::RED.a(0.20), pal::RED, Action::CalcClear),
+                    "accent" => (pal::ACCENT, pal::BLACK, Action::CommandRun),
+                    "op" => (pal::CARD, pal::ACCENT, Action::CalcInput(val)),
+                    "fn" => (pal::CARD, pal::WATER, Action::CalcInput(val)),
+                    _ => (pal::CARD_HI, pal::TEXT, Action::CalcInput(val)),
+                };
+                c.button(rect, label, act, fill, fg);
+            }
+        }
     }
 }

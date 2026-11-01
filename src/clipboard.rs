@@ -134,6 +134,30 @@ impl Clipboard {
         self.items.retain(|i| i.pinned);
         self.save();
     }
+
+    pub fn record_text(&mut self, text: &str) {
+        if let Some(pos) = self.items.iter().position(|i| matches!(&i.data, ClipData::Text(x) if x == text)) {
+            let it = self.items.remove(pos);
+            self.items.insert(0, it);
+            self.save();
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.items.insert(0, ClipItem { data: ClipData::Text(text.to_string()), pinned: false, id });
+        while self.items.iter().filter(|i| !i.pinned).count() > MAX_ITEMS {
+            if let Some(p) = self.items.iter().rposition(|i| !i.pinned) {
+                self.items.remove(p);
+            }
+        }
+        self.save();
+    }
+}
+
+pub fn set_text(text: &str) -> bool {
+    let u: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let bytes = unsafe { std::slice::from_raw_parts(u.as_ptr() as *const u8, u.len() * 2) };
+    unsafe { set_clipboard(HWND(std::ptr::null_mut()), CF_UNICODETEXT.0 as u32, bytes) }
 }
 
 unsafe fn open(hwnd: HWND) -> bool {

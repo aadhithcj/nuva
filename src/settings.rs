@@ -48,6 +48,25 @@ pub struct Settings {
     pub notif_popup: bool,
     pub stats: bool,
     pub autohide_window: bool,
+    pub exclude_capture: bool,
+    pub mic_privacy: bool,
+    pub scroll_volume: bool,
+    pub downloads: bool,
+    // Page visibility options
+    pub page_home: bool,
+    pub page_timer: bool,
+    pub page_water: bool,
+    pub page_todo: bool,
+    pub page_calendar: bool,
+    pub page_shelf: bool,
+    pub page_clipboard: bool,
+    pub page_notifs: bool,
+    pub page_stats: bool,
+    pub page_calc: bool,
+    // Header tool visibility options
+    pub tool_picker: bool,
+    pub tool_search: bool,
+    pub tool_audio: bool,
 }
 
 impl Default for Settings {
@@ -87,6 +106,23 @@ impl Default for Settings {
             notif_popup: true,
             stats: true,
             autohide_window: true,
+            exclude_capture: true,
+            mic_privacy: true,
+            scroll_volume: true,
+            downloads: true,
+            page_home: true,
+            page_timer: true,
+            page_water: true,
+            page_todo: true,
+            page_calendar: true,
+            page_shelf: true,
+            page_clipboard: true,
+            page_notifs: true,
+            page_stats: true,
+            page_calc: true,
+            tool_picker: true,
+            tool_search: true,
+            tool_audio: true,
         }
     }
 }
@@ -97,7 +133,10 @@ pub const BOOL_KEYS: &[&str] = &[
     "hud_brightness", "hud_caps", "hud_language", "popup_battery", "popup_wifi", "popup_bluetooth",
     "open_click", "page_icons", "fast_animation", "shelf_clear", "calendar_week", "hide_fullscreen",
     "water", "lyrics_pill", "clipboard", "clip_persist", "notifications", "notif_popup", "stats",
-    "autohide_window",
+    "autohide_window", "exclude_capture", "mic_privacy", "scroll_volume", "downloads",
+    "page_home", "page_timer", "page_water", "page_todo", "page_calendar", "page_shelf",
+    "page_clipboard", "page_notifs", "page_stats", "page_calc",
+    "tool_picker", "tool_search", "tool_audio",
 ];
 pub const NUM_KEYS: &[&str] = &["size", "display", "snooze", "focus", "short_break", "long_break"];
 
@@ -170,6 +209,23 @@ impl Settings {
             "notif_popup" => &mut self.notif_popup,
             "stats" => &mut self.stats,
             "autohide_window" => &mut self.autohide_window,
+            "exclude_capture" => &mut self.exclude_capture,
+            "mic_privacy" => &mut self.mic_privacy,
+            "scroll_volume" => &mut self.scroll_volume,
+            "downloads" => &mut self.downloads,
+            "page_home" => &mut self.page_home,
+            "page_timer" => &mut self.page_timer,
+            "page_water" => &mut self.page_water,
+            "page_todo" => &mut self.page_todo,
+            "page_calendar" => &mut self.page_calendar,
+            "page_shelf" => &mut self.page_shelf,
+            "page_clipboard" => &mut self.page_clipboard,
+            "page_notifs" => &mut self.page_notifs,
+            "page_stats" => &mut self.page_stats,
+            "page_calc" => &mut self.page_calc,
+            "tool_picker" => &mut self.tool_picker,
+            "tool_search" => &mut self.tool_search,
+            "tool_audio" => &mut self.tool_audio,
             _ => return None,
         })
     }

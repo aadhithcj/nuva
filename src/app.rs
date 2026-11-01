@@ -54,6 +54,7 @@ const T_NET: usize = 6;
 const T_BLINK: usize = 7;
 const T_LANG: usize = 8;
 const T_EDGE_POLL: usize = 9;
+const T_VOLUME_COOLDOWN: usize = 10;
 
 const GUID_ACDC_POWER_SOURCE: GUID = GUID::from_u128(0x5d3e9a59_e9d5_4b00_a6bd_ff34ff516548);
 const GUID_BATTERY_PERCENTAGE: GUID = GUID::from_u128(0xa7ad8041_b45a_4cae_87a3_eecbb468a9e1);
@@ -80,6 +81,7 @@ pub enum Page {
     Clipboard,
     Notifs,
     Stats,
+    Calc,
 }
 
 impl Page {
@@ -94,6 +96,7 @@ impl Page {
             Page::Clipboard => ico::CLIPBOARD,
             Page::Notifs => ico::BELL,
             Page::Stats => ico::STATS,
+            Page::Calc => ico::CALCULATOR,
         }
     }
     pub fn title(self) -> &'static str {
@@ -107,6 +110,7 @@ impl Page {
             Page::Clipboard => "Clipboard",
             Page::Notifs => "Notifications",
             Page::Stats => "System",
+            Page::Calc => "Calculator",
         }
     }
 }
@@ -262,6 +266,14 @@ pub struct App {
     pub is_desktop: bool,
     pub window_hovered: bool,
     pub last_fg: isize,
+    pub mic_active: bool,
+    pub mic_muted: bool,
+    pub picking_color: bool,
+    pub preview_color: Option<(u8, u8, u8)>,
+    pub cmd: crate::cmd::CommandPalette,
+    pub live_activity: Option<crate::events::LiveActivityData>,
+    pub download: Option<crate::events::DownloadInfo>,
+    pub last_volume_scroll: Option<Instant>,
 }
 
 static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
@@ -378,6 +390,14 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             is_desktop: true,
             window_hovered: false,
             last_fg: 0,
+            mic_active: false,
+            mic_muted: false,
+            picking_color: false,
+            preview_color: None,
+            cmd: crate::cmd::CommandPalette::new(),
+            live_activity: None,
+            download: None,
+            last_volume_scroll: None,
             settings,
         });
         app.cal_reset();
@@ -396,6 +416,8 @@ pub fn run(open_settings: bool, preview: Option<String>) {
         system::watch_bluetooth();
         notifications::set_enabled(app.settings.notifications);
         notifications::start();
+        system::start_pipe_listener();
+        let _ = SetWindowDisplayAffinity(hwnd, WINDOW_DISPLAY_AFFINITY(if app.settings.exclude_capture { 17 } else { 0 }));
         app.volume = Volume::new();
         app.lang = system::input_language().0;
         let is_desktop = system::is_desktop_homescreen(&app.monitor, hwnd);
@@ -408,8 +430,11 @@ pub fn run(open_settings: bool, preview: Option<String>) {
         SetTimer(hwnd, T_EDGE_POLL, 25, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         if let Some(p) = preview {
-            let all = [Page::Home, Page::Timer, Page::Water, Page::Todo, Page::Calendar, Page::Shelf, Page::Clipboard, Page::Notifs, Page::Stats];
-            app.page = all.into_iter().find(|x| x.title().eq_ignore_ascii_case(&p) || format!("{x:?}").eq_ignore_ascii_case(&p)).unwrap_or(Page::Home);
+            let all = [Page::Home, Page::Timer, Page::Water, Page::Todo, Page::Calendar, Page::Shelf, Page::Clipboard, Page::Notifs, Page::Stats, Page::Calc];
+            app.page = all.into_iter().find(|x| x.title().eq_ignore_ascii_case(&p) || format!("{x:?}").eq_ignore_ascii_case(&p) || p.eq_ignore_ascii_case("calc")).unwrap_or(Page::Home);
+            if app.page == Page::Calc {
+                app.set_activatable(true);
+            }
             app.preview = true;
             app.expanded = true;
             if p.eq_ignore_ascii_case("lyrics") {
@@ -662,19 +687,39 @@ impl App {
     // ------------------------------------------------ what to show
 
     pub fn pages(&self) -> Vec<Page> {
-        let mut v = vec![Page::Home, Page::Timer];
-        if self.settings.water {
+        let mut v = Vec::new();
+        if self.settings.page_home {
+            v.push(Page::Home);
+        }
+        if self.settings.page_timer {
+            v.push(Page::Timer);
+        }
+        if self.settings.water && self.settings.page_water {
             v.push(Page::Water);
         }
-        v.extend([Page::Todo, Page::Calendar, Page::Shelf]);
-        if self.settings.clipboard {
+        if self.settings.page_todo {
+            v.push(Page::Todo);
+        }
+        if self.settings.page_calendar {
+            v.push(Page::Calendar);
+        }
+        if self.settings.page_shelf {
+            v.push(Page::Shelf);
+        }
+        if self.settings.clipboard && self.settings.page_clipboard {
             v.push(Page::Clipboard);
         }
-        if self.settings.notifications {
+        if self.settings.notifications && self.settings.page_notifs {
             v.push(Page::Notifs);
         }
-        if self.settings.stats {
+        if self.settings.stats && self.settings.page_stats {
             v.push(Page::Stats);
+        }
+        if self.settings.page_calc {
+            v.push(Page::Calc);
+        }
+        if v.is_empty() {
+            v.push(Page::Home);
         }
         v
     }
@@ -741,7 +786,7 @@ impl App {
                 self.on_wheel(-delta);
             }
             WM_MOUSEACTIVATE => {
-                let focus = self.editor.as_ref().map(|e| e.focused).unwrap_or(false);
+                let focus = self.editor.as_ref().map(|e| e.focused).unwrap_or(false) || self.page == Page::Calc;
                 return Some(LRESULT(if focus { MA_ACTIVATE } else { MA_NOACTIVATE } as isize));
             }
             WM_CHAR => self.on_char(wp.0 as u32),
@@ -790,6 +835,17 @@ impl App {
                 self.check_fullscreen();
                 self.check_desktop_state();
             }
+            events::WM_APP_COLOR_PICKED => {
+                let pixel = wp.0 as u32;
+                let r = (pixel & 0xff) as u8;
+                let g = ((pixel >> 8) & 0xff) as u8;
+                let b = ((pixel >> 16) & 0xff) as u8;
+                let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                self.clip.record_text(&hex);
+                self.picking_color = false;
+                self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Color Copied", &hex, None, 2.5);
+                self.request_frame();
+            }
             WM_POWERBROADCAST => {
                 if wp.0 == 0x8013 && lp.0 != 0 {
                     let ps = unsafe { &*(lp.0 as *const PowerSetting) };
@@ -823,7 +879,16 @@ impl App {
                 unsafe {
                     let _ = KillTimer(self.hwnd, T_OPEN);
                 }
-                if self.cursor_in_notch() && !self.expanded {
+                let is_vol_cooldown = self.last_volume_scroll.as_ref().map(|t| t.elapsed() < Duration::from_millis(2000)).unwrap_or(false);
+                if self.cursor_in_notch() && !self.expanded && !is_vol_cooldown {
+                    self.expand(true);
+                }
+            }
+            T_VOLUME_COOLDOWN => {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, T_VOLUME_COOLDOWN);
+                }
+                if self.cursor_in_notch() && !self.expanded && !self.settings.open_click && self.alerts.is_empty() {
                     self.expand(true);
                 }
             }
@@ -894,8 +959,11 @@ impl App {
         }
         self.expanded = open;
         if open {
+            if self.page == Page::Calc {
+                self.set_activatable(true);
+            }
             // Music starting is the most common reason to open; land on it.
-            if self.media.playing && self.page != Page::Home && !self.drag_over {
+            if self.media.playing && self.page != Page::Home && !self.drag_over && self.page != Page::Calc {
                 self.page = Page::Home;
             }
         } else {
@@ -922,7 +990,8 @@ impl App {
         unsafe {
             let _ = KillTimer(self.hwnd, T_CLOSE);
         }
-        if !self.expanded && !self.settings.open_click && self.alerts.is_empty() {
+        let is_vol_cooldown = self.last_volume_scroll.as_ref().map(|t| t.elapsed() < Duration::from_millis(2000)).unwrap_or(false);
+        if !self.expanded && !self.settings.open_click && self.alerts.is_empty() && !is_vol_cooldown {
             unsafe {
                 SetTimer(self.hwnd, T_OPEN, 90, None);
             }
@@ -954,6 +1023,28 @@ impl App {
     }
 
     fn on_down(&mut self, x: f32, y: f32) {
+        if self.picking_color {
+            unsafe {
+                let mut pt = windows::Win32::Foundation::POINT::default();
+                if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_ok() {
+                    let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+                    let pixel = windows::Win32::Graphics::Gdi::GetPixel(hdc, pt.x, pt.y);
+                    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+                    let r = (pixel.0 & 0xff) as u8;
+                    let g = ((pixel.0 >> 8) & 0xff) as u8;
+                    let b = ((pixel.0 >> 16) & 0xff) as u8;
+                    let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                    crate::clipboard::set_text(&hex);
+                    self.clip.record_text(&hex);
+                    self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Color Copied", &hex, None, 2.5);
+                }
+            }
+            self.picking_color = false;
+            self.preview_color = None;
+            self.request_frame();
+            return;
+        }
+
         if !self.expanded && self.alerts.is_empty() {
             self.expand(true);
             return;
@@ -1007,22 +1098,47 @@ impl App {
 
     fn on_wheel(&mut self, delta: f32) {
         let Some((x, y)) = self.mouse else { return };
-        let View::Open(page) = self.view() else { return };
-        let (_, h, _) = self.view_size(View::Open(page));
-        // Wheel over the page dots switches pages.
-        if y > h - 26.0 {
-            let pages = self.pages();
-            if let Some(i) = pages.iter().position(|p| *p == page) {
-                let n = (i as i32 - delta.signum() as i32).clamp(0, pages.len() as i32 - 1) as usize;
-                self.page = pages[n];
+        match self.view() {
+            View::Open(page) => {
+                let (_, h, _) = self.view_size(View::Open(page));
+                // Wheel over the page dots or header switches pages.
+                if y > h - 26.0 || y < 30.0 {
+                    let pages = self.pages();
+                    if let Some(i) = pages.iter().position(|p| *p == page) {
+                        let n = (i as i32 - delta.signum() as i32).clamp(0, pages.len() as i32 - 1) as usize;
+                        self.page = pages[n];
+                        if self.page == Page::Calc {
+                            self.set_activatable(true);
+                        } else if self.editor.is_none() {
+                            self.set_activatable(false);
+                        }
+                    }
+                } else if page == Page::Home && self.show_split && x > WIN_W / 2.0 {
+                    // Manual lyric scrolling is not needed; ignore.
+                } else {
+                    let s = self.scroll.entry(page).or_insert(0.0);
+                    *s = (*s - delta * 40.0).max(0.0);
+                }
             }
-        } else if page == Page::Home && self.show_split && x > WIN_W / 2.0 {
-            // Manual lyric scrolling is not needed; ignore.
-        } else {
-            let s = self.scroll.entry(page).or_insert(0.0);
-            *s = (*s - delta * 40.0).max(0.0);
+            View::Pill | View::Toast => {
+                if self.settings.scroll_volume {
+                    self.last_volume_scroll = Some(Instant::now());
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, T_OPEN);
+                        let _ = SetTimer(self.hwnd, T_VOLUME_COOLDOWN, 2000, None);
+                    }
+                    self.change_volume(delta * 0.02);
+                }
+            }
+            _ => {}
         }
         self.request_frame();
+    }
+
+    pub fn change_volume(&mut self, delta: f32) {
+        if let Some(v) = &self.volume {
+            v.change_volume(delta);
+        }
     }
 
     pub fn set_activatable(&mut self, on: bool) {
@@ -1041,6 +1157,55 @@ impl App {
     }
 
     fn on_char(&mut self, ch: u32) {
+        if self.picking_color && ch == 27 {
+            system::stop_color_picker();
+            self.picking_color = false;
+            self.show_toast(ToastKind::Notification, ico::CLOSE, pal::DIM, "Color Picker", "Cancelled", None, 1.5);
+            self.request_frame();
+            return;
+        }
+
+        if self.page == Page::Calc {
+            match ch {
+                8 => {
+                    self.cmd.backspace();
+                    self.request_frame();
+                }
+                13 => {
+                    self.dispatch(Action::CommandRun);
+                }
+                27 => {
+                    self.cmd.clear();
+                    self.set_activatable(false);
+                    self.page = Page::Home;
+                    self.request_frame();
+                }
+                22 => {
+                    if let Some(t) = read_clip_text(self.hwnd) {
+                        for c in t.chars() {
+                            if !c.is_control() {
+                                self.cmd.push_char(c);
+                            }
+                        }
+                        self.request_frame();
+                    }
+                }
+                c if c >= 32 => {
+                    if let Some(ch) = char::from_u32(c) {
+                        self.cmd.push_char(ch);
+                        self.request_frame();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.expanded && (ch == '/' as u32 || ch == 11) && self.editor.is_none() {
+            self.dispatch(Action::OpenCommandPalette);
+            return;
+        }
+
         let Some(e) = &mut self.editor else { return };
         if !e.focused {
             return;
@@ -1141,6 +1306,11 @@ impl App {
             "lyrics_pill" => self.maybe_fetch_lyrics(),
             "hide_fullscreen" => self.check_fullscreen(),
             "autohide_window" => self.check_desktop_state(),
+            "exclude_capture" => {
+                unsafe {
+                    let _ = SetWindowDisplayAffinity(self.hwnd, WINDOW_DISPLAY_AFFINITY(if self.settings.exclude_capture { 17 } else { 0 }));
+                }
+            }
             "pet" => self.update_pet(),
             _ => {}
         }
@@ -1167,6 +1337,11 @@ impl App {
             Action::Page(i) => {
                 if let Some(p) = self.pages().get(i) {
                     self.page = *p;
+                    if self.page == Page::Calc {
+                        self.set_activatable(true);
+                    } else if self.editor.is_none() {
+                        self.set_activatable(false);
+                    }
                 }
             }
             Action::PlayPause => {
@@ -1272,6 +1447,97 @@ impl App {
             }
             Action::ShelfRemove(i) => self.shelf.remove(i),
             Action::ShelfClear => self.shelf.clear(),
+            Action::ShelfCopyPath(i) => {
+                let info = self.shelf.items.get(i).map(|it| (it.path.display().to_string(), it.label.clone()));
+                if let Some((path_str, label)) = info {
+                    crate::clipboard::set_text(&path_str);
+                    self.clip.record_text(&path_str);
+                    self.show_toast(ToastKind::Notification, ico::LINK, pal::ACCENT, "Path Copied", &label, None, 1.8);
+                }
+            }
+            Action::ShelfConvert(i) => {
+                if let Some(out_p) = self.shelf.convert_image(i) {
+                    let name = out_p.file_name().unwrap_or_default().to_string_lossy();
+                    self.show_toast(ToastKind::Notification, ico::CONVERT, pal::GREEN, "Image Converted", &name, None, 2.5);
+                }
+            }
+            Action::ShelfZip(i) => {
+                if let Some(out_p) = self.shelf.zip_item(i) {
+                    let name = out_p.file_name().unwrap_or_default().to_string_lossy();
+                    self.show_toast(ToastKind::Notification, ico::ZIP, pal::GREEN, "Created ZIP Archive", &name, None, 2.5);
+                }
+            }
+            Action::ShelfExplore(i) => {
+                if let Some(item) = self.shelf.items.get(i) {
+                    let _ = std::process::Command::new("explorer.exe")
+                        .arg(format!("/select,\"{}\"", item.path.display()))
+                        .spawn();
+                }
+            }
+            Action::ToggleMicMute => {
+                if let Some(muted) = system::toggle_mic_mute() {
+                    self.mic_muted = muted;
+                    if muted {
+                        self.show_toast(ToastKind::Notification, ico::MIC_OFF, pal::RED, "Microphone", "Muted", None, 1.8);
+                    } else {
+                        self.show_toast(ToastKind::Notification, ico::MIC, pal::GREEN, "Microphone", "Unmuted", None, 1.8);
+                    }
+                }
+            }
+            Action::CycleAudioDevice => {
+                if let Some(name) = system::cycle_audio_output() {
+                    self.show_toast(ToastKind::Notification, ico::SPEAKER, pal::ACCENT, "Audio Output", &name, None, 2.2);
+                }
+            }
+            Action::PickColor => {
+                self.picking_color = true;
+                system::start_color_picker(self.hwnd);
+                self.show_toast(ToastKind::Notification, ico::EYEDROPPER, pal::ACCENT, "Color Picker", "Click any pixel on screen (Right-click to cancel)", None, 4.0);
+            }
+            Action::OpenCommandPalette => {
+                self.page = Page::Calc;
+                self.cmd.active = true;
+                self.set_activatable(true);
+                self.expand(true);
+            }
+            Action::CalcInput(s) => {
+                for c in s.chars() {
+                    self.cmd.push_char(c);
+                }
+                self.set_activatable(true);
+                self.request_frame();
+            }
+            Action::CalcClear => {
+                self.cmd.clear();
+                self.request_frame();
+            }
+            Action::CalcBackspace => {
+                self.cmd.backspace();
+                self.request_frame();
+            }
+            Action::CommandRun => {
+                if let Some(item) = self.cmd.result.clone() {
+                    match item.kind {
+                        crate::cmd::CommandKind::Copy(s) => {
+                            crate::clipboard::set_text(&s);
+                            self.clip.record_text(&s);
+                            self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Copied to Clipboard", &s, None, 2.0);
+                        }
+                        crate::cmd::CommandKind::Launch(cmd) => {
+                            let _ = std::process::Command::new("cmd").args(["/c", "start", "", &cmd]).spawn();
+                        }
+                        crate::cmd::CommandKind::Page(idx) => {
+                            let pages = self.pages();
+                            if let Some(p) = pages.get(idx) {
+                                self.page = *p;
+                            }
+                        }
+                        crate::cmd::CommandKind::Action(act) => {
+                            self.dispatch(act);
+                        }
+                    }
+                }
+            }
             Action::ClipCopy(i) => {
                 self.clip.copy(i, self.hwnd);
                 self.show_toast(ToastKind::Info, ico::COPY, pal::GREEN, "Copied", "", None, 1.0);
@@ -1395,6 +1661,24 @@ impl App {
         if now.minute != self.last_minute {
             self.last_minute = now.minute;
             dirty = true;
+        }
+
+        if self.settings.mic_privacy {
+            let active = system::mic_in_use();
+            let muted = system::mic_muted().unwrap_or(false);
+            if active != self.mic_active || muted != self.mic_muted {
+                self.mic_active = active;
+                self.mic_muted = muted;
+                dirty = true;
+            }
+        }
+
+        if self.settings.downloads {
+            let dl = system::check_active_downloads();
+            if dl.is_some() != self.download.is_some() {
+                self.download = dl;
+                dirty = true;
+            }
         }
 
         if let Some(done) = self.pomo.tick(&self.settings) {
@@ -1766,6 +2050,15 @@ impl App {
                 if let Some(src) = self.gfx.decode(&bytes, 64) {
                     self.notif_srcs.insert(app, src);
                 }
+            }
+            Event::LiveActivity(act) => {
+                if let Some(a) = &act {
+                    if a.progress.is_none() {
+                        self.show_toast(ToastKind::Notification, ico::INFO, pal::ACCENT, &a.title, &a.sub, None, 3.5);
+                    }
+                }
+                self.live_activity = act;
+                self.request_frame();
             }
         }
     }

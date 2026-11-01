@@ -1,6 +1,8 @@
 //! System integrations: volume, keyboard (Caps Lock / input language), battery, network,
 //! Bluetooth headsets, monitors, idle time and full-screen detection.
 
+#![allow(non_snake_case)]
+
 use crate::events::{self, Event, WM_APP_CAPS, WM_APP_LANGCHECK, WM_APP_VOLUME};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,7 +11,8 @@ use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice, Bl
 use windows::Devices::Enumeration::{DeviceInformation, DeviceInformationUpdate, DeviceWatcher};
 use windows::Foundation::TypedEventHandler;
 use windows::Networking::Connectivity::{NetworkConnectivityLevel, NetworkInformation, NetworkStatusChangedEventHandler};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Registry::{RegCloseKey, RegEnumKeyW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ};
 use windows::Win32::Globalization::{GetLocaleInfoEx, LCIDToLocaleName, LOCALE_SISO639LANGNAME, LOCALE_SLOCALIZEDDISPLAYNAME};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
@@ -91,6 +94,19 @@ impl Volume {
             if let Ok(ep) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
                 let _ = ep.RegisterControlChangeNotify(&self.cb);
                 self.endpoint = Some(ep);
+            }
+        }
+    }
+
+    pub fn change_volume(&self, delta: f32) {
+        unsafe {
+            let Some(ep) = self.endpoint.as_ref() else { return };
+            if let Ok(cur) = ep.GetMasterVolumeLevelScalar() {
+                let new_v = (cur + delta).clamp(0.0, 1.0);
+                let _ = ep.SetMasterVolumeLevelScalar(new_v, std::ptr::null());
+                if new_v > 0.0 && ep.GetMute().map(|m| m.as_bool()).unwrap_or(false) {
+                    let _ = ep.SetMute(false, std::ptr::null());
+                }
             }
         }
     }
@@ -421,4 +437,320 @@ pub fn is_desktop_homescreen(mon: &RECT, own: HWND) -> bool {
         // check whether any open application windows exist on this monitor.
         !has_open_windows_on(mon, own)
     }
+}
+
+// ---------------------------------------------------------------- microphone
+
+pub fn mic_in_use() -> bool {
+    unsafe {
+        let base_path = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone");
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, base_path, 0, KEY_READ, &mut key).is_ok() {
+            if check_consent_key(key) {
+                let _ = RegCloseKey(key);
+                return true;
+            }
+            let _ = RegCloseKey(key);
+        }
+        let np_path = windows::core::w!(r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged");
+        if RegOpenKeyExW(HKEY_CURRENT_USER, np_path, 0, KEY_READ, &mut key).is_ok() {
+            if check_consent_key(key) {
+                let _ = RegCloseKey(key);
+                return true;
+            }
+            let _ = RegCloseKey(key);
+        }
+    }
+    false
+}
+
+unsafe fn check_consent_key(key: HKEY) -> bool {
+    let mut index = 0;
+    let mut name = [0u16; 260];
+    while RegEnumKeyW(key, index, Some(&mut name)) == windows::Win32::Foundation::ERROR_SUCCESS {
+        index += 1;
+        let mut sub = HKEY::default();
+        if RegOpenKeyExW(key, PCWSTR(name.as_ptr()), 0, KEY_READ, &mut sub).is_ok() {
+            let mut stop = 0u64;
+            let mut start = 0u64;
+            let mut sz = 8u32;
+            let _ = RegQueryValueExW(sub, windows::core::w!("LastUsedTimeStop"), None, None, Some(&mut stop as *mut _ as *mut u8), Some(&mut sz));
+            sz = 8;
+            let _ = RegQueryValueExW(sub, windows::core::w!("LastUsedTimeStart"), None, None, Some(&mut start as *mut _ as *mut u8), Some(&mut sz));
+            let _ = RegCloseKey(sub);
+            if stop == 0 && start > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn mic_muted() -> Option<bool> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let dev = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        let ep = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()?;
+        Some(ep.GetMute().ok()?.as_bool())
+    }
+}
+
+pub fn toggle_mic_mute() -> Option<bool> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let dev = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        let ep = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()?;
+        let current = ep.GetMute().ok()?.as_bool();
+        let target = !current;
+        let _ = ep.SetMute(target, std::ptr::null());
+        Some(target)
+    }
+}
+
+// ---------------------------------------------------------------- audio switcher
+
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+pub fn list_audio_devices() -> Vec<AudioDevice> {
+    let mut list = Vec::new();
+    unsafe {
+        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return list };
+        let def_id = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)
+            .and_then(|d| d.GetId())
+            .map(|id| id.to_string().unwrap_or_default())
+            .unwrap_or_default();
+        let Ok(col) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return list };
+        let count = col.GetCount().unwrap_or(0);
+        for i in 0..count {
+            if let Ok(dev) = col.Item(i) {
+                let id = dev.GetId().map(|id| id.to_string().unwrap_or_default()).unwrap_or_default();
+                let name = get_device_name(&dev).unwrap_or_else(|| "Audio Device".into());
+                let is_default = id == def_id;
+                list.push(AudioDevice { id, name, is_default });
+            }
+        }
+    }
+    list
+}
+
+unsafe fn get_device_name(dev: &IMMDevice) -> Option<String> {
+    let ps = dev.OpenPropertyStore(windows::Win32::System::Com::STGM_READ).ok()?;
+    let pkey = PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+        pid: 14,
+    };
+    let pv = ps.GetValue(&pkey).ok()?;
+    let s = pv.to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+unsafe trait IPolicyConfig: windows::core::IUnknown {
+    fn GetMixFormat(&self) -> windows::core::HRESULT;
+    fn GetDeviceFormat(&self) -> windows::core::HRESULT;
+    fn ResetDeviceFormat(&self) -> windows::core::HRESULT;
+    fn SetDeviceFormat(&self) -> windows::core::HRESULT;
+    fn GetProcessingPeriod(&self) -> windows::core::HRESULT;
+    fn SetProcessingPeriod(&self) -> windows::core::HRESULT;
+    fn GetShareMode(&self) -> windows::core::HRESULT;
+    fn SetShareMode(&self) -> windows::core::HRESULT;
+    fn GetPropertyValue(&self) -> windows::core::HRESULT;
+    fn SetPropertyValue(&self) -> windows::core::HRESULT;
+    fn SetDefaultEndpoint(&self, wsz_device_id: PCWSTR, role: i32) -> windows::core::HRESULT;
+    fn SetEndpointVisibility(&self) -> windows::core::HRESULT;
+}
+
+const CLSID_POLICY_CONFIG: windows::core::GUID = windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+pub fn cycle_audio_output() -> Option<String> {
+    let devices = list_audio_devices();
+    if devices.is_empty() { return None; }
+    let cur_idx = devices.iter().position(|d| d.is_default).unwrap_or(0);
+    let next_idx = (cur_idx + 1) % devices.len();
+    let next_dev = &devices[next_idx];
+    set_default_audio_device(&next_dev.id);
+    Some(next_dev.name.clone())
+}
+
+pub fn set_default_audio_device(device_id: &str) -> bool {
+    unsafe {
+        let policy: Result<IPolicyConfig> = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL);
+        if let Ok(p) = policy {
+            let id_w: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+            let _ = p.SetDefaultEndpoint(PCWSTR(id_w.as_ptr()), 0); // eConsole
+            let _ = p.SetDefaultEndpoint(PCWSTR(id_w.as_ptr()), 1); // eMultimedia
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------- downloads
+
+pub fn check_active_downloads() -> Option<crate::events::DownloadInfo> {
+    let downloads_dir = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Downloads"))?;
+    if !downloads_dir.exists() { return None; }
+
+    let entries = std::fs::read_dir(downloads_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("crdownload") || ext.eq_ignore_ascii_case("part") || ext.eq_ignore_ascii_case("download") {
+                let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Downloading").to_string();
+                let meta = entry.metadata().ok();
+                let bytes = meta.map(|m| m.len()).unwrap_or(0);
+                let size_str = if bytes > 1024 * 1024 * 1024 {
+                    format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                } else {
+                    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+                };
+                return Some(crate::events::DownloadInfo {
+                    filename: file_name,
+                    size_str,
+                    progress: None,
+                });
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- live activity pipe
+
+pub fn start_pipe_listener() {
+    std::thread::spawn(|| {
+        unsafe {
+            use windows::Win32::System::Pipes::*;
+            use windows::Win32::Storage::FileSystem::*;
+            let pipe_name = windows::core::w!(r"\\.\pipe\nuva_notch");
+            loop {
+                let pipe = CreateNamedPipeW(
+                    pipe_name,
+                    PIPE_ACCESS_INBOUND,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    1024,
+                    1024,
+                    0,
+                    None,
+                );
+                if pipe.is_invalid() {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    continue;
+                }
+                if ConnectNamedPipe(pipe, None).is_ok() {
+                    let mut buf = [0u8; 1024];
+                    let mut read = 0u32;
+                    if ReadFile(HANDLE(pipe.0), Some(&mut buf), Some(&mut read), None).is_ok() && read > 0 {
+                        let text = String::from_utf8_lossy(&buf[..read as usize]);
+                        handle_pipe_message(&text);
+                    }
+                    let _ = DisconnectNamedPipe(pipe);
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(pipe);
+            }
+        }
+    });
+}
+
+fn handle_pipe_message(text: &str) {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("clear") {
+        events::push(events::Event::LiveActivity(None));
+        return;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(notify) = v.get("notify").and_then(|n| n.as_str()) {
+            let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
+            events::push(events::Event::LiveActivity(Some(events::LiveActivityData {
+                title: notify.to_string(),
+                sub: sub.to_string(),
+                progress: None,
+            })));
+        } else if let Some(title) = v.get("title").and_then(|t| t.as_str()) {
+            let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
+            let progress = v.get("progress").and_then(|p| p.as_f64()).map(|p| p as f32);
+            events::push(events::Event::LiveActivity(Some(events::LiveActivityData {
+                title: title.to_string(),
+                sub: sub.to_string(),
+                progress,
+            })));
+        }
+    } else {
+        events::push(events::Event::LiveActivity(Some(events::LiveActivityData {
+            title: trimmed.to_string(),
+            sub: String::new(),
+            progress: None,
+        })));
+    }
+}
+
+static mut COLOR_HOOK: windows::Win32::UI::WindowsAndMessaging::HHOOK = windows::Win32::UI::WindowsAndMessaging::HHOOK(std::ptr::null_mut());
+static COLOR_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+pub fn start_color_picker(hwnd: windows::Win32::Foundation::HWND) {
+    unsafe {
+        stop_color_picker();
+        COLOR_TARGET.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+        let hook = windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(
+            windows::Win32::UI::WindowsAndMessaging::WH_MOUSE_LL,
+            Some(mouse_color_hook_proc),
+            windows::Win32::Foundation::HINSTANCE(std::ptr::null_mut()),
+            0,
+        );
+        if let Ok(h) = hook {
+            COLOR_HOOK = h;
+        }
+    }
+}
+
+pub fn stop_color_picker() {
+    unsafe {
+        if !COLOR_HOOK.0.is_null() {
+            let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(COLOR_HOOK);
+            COLOR_HOOK = windows::Win32::UI::WindowsAndMessaging::HHOOK(std::ptr::null_mut());
+        }
+    }
+}
+
+unsafe extern "system" fn mouse_color_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::Foundation::*;
+    if code >= 0 {
+        let msg = wparam.0 as u32;
+        if msg == WM_LBUTTONDOWN {
+            let ms = *(lparam.0 as *const MSLLHOOKSTRUCT);
+            let hdc = GetDC(None);
+            let pixel = GetPixel(hdc, ms.pt.x, ms.pt.y);
+            let _ = ReleaseDC(None, hdc);
+            let r = (pixel.0 & 0xff) as u8;
+            let g = ((pixel.0 >> 8) & 0xff) as u8;
+            let b = ((pixel.0 >> 16) & 0xff) as u8;
+            let hex = format!("#{r:02X}{g:02X}{b:02X}");
+            crate::clipboard::set_text(&hex);
+            let target = COLOR_TARGET.load(std::sync::atomic::Ordering::SeqCst);
+            if target != 0 {
+                let _ = PostMessageW(HWND(target as *mut _), events::WM_APP_COLOR_PICKED, WPARAM(pixel.0 as usize), LPARAM(0));
+            }
+            stop_color_picker();
+            return LRESULT(1);
+        } else if msg == WM_RBUTTONDOWN {
+            stop_color_picker();
+            return LRESULT(1);
+        }
+    }
+    CallNextHookEx(COLOR_HOOK, code, wparam, lparam)
 }

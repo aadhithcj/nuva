@@ -38,6 +38,22 @@ Everything from the original:
 
 New in this build:
 
+- **Dedicated Calculator Page & Command Palette**: Interactive 5×5 on-screen keypad (`0-9`, `.`, `+`, `-`, `×`, `÷`, `^`, `%`, `√`, `sin`, `cos`, `π`, `(`, `)`, `C`, `=`), live equation input with evaluated result (`= 110`), and direct physical keyboard typing. Also converts units (`50 km to mi`, `32 c to f`), runs quick math, and launches apps (`calc`, `wt`, `notepad`).
+- **Page Management in Settings**: A dedicated "Pages" section in Settings lets you toggle any page on or off (Now Playing, Focus Timer, Water, To-do, Calendar, Shelf, Clipboard, Notifications, System Stats, Calculator). Disabled pages are completely hidden from the notch's page dots and swipe gestures.
+- **Microphone Privacy Dot & 1-Click Mute**: Real-time orange indicator dot when any app uses your microphone (via Windows `ConsentStore`); click the header mic button to toggle system mic mute with instant toast feedback.
+- **Download Progress**: Subtle glow progress bar along the notch bottom edge when downloads are active (`.crdownload`, `.part`, `.download`).
+- **1-Click Audio Output Switcher**: Instant cycle between speakers, headphones, and Bluetooth earbuds from the notch header without opening Windows Sound settings.
+- **Screen Color Picker / Eyedropper**: One click on the eyedropper icon lets you click any pixel on any monitor/app to copy its HEX `#RRGGBB` directly to your clipboard and Clipboard History (powered by low-level hook `WH_MOUSE_LL`). Right-click or press Esc to cancel.
+- **Scroll-on-pill Volume Gesture with Cooldown**: Scroll the mouse wheel on the collapsed notch to change system volume. Keeps the notch in small pill mode and prevents accidental hover expansion until 2 seconds after you finish scrolling.
+- **Quick File Actions**: Hover any dropped file on the Shelf to copy path, convert image (PNG ↔ JPG), compress to ZIP, or reveal in Explorer.
+- **Screen Capture Exclusion**: Hides the notch window from screen sharing, recordings, and screenshots (Zoom, Teams, Discord, OBS Studio) via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
+- **Live Activity API & CLI**: Push tasks, notifications, and progress from terminal scripts or CI via named pipe `\\.\pipe\nuva_notch`:
+  ```powershell
+  nuva --activity "Building project" --progress 75
+  nuva --notify "Build Passed" --sub "All 42 tests green"
+  nuva --clear-activity
+  ```
+- **Header Tools Customization**: Under Settings > HUD & Popups > Header Tools, toggle individual buttons for Color Picker, Calculator/Search, Audio Switcher, and Mic Privacy.
 - **Clipboard history** (text and images, pin and remove). It skips apps that mark clipboard data as private.
 - **Notification mirror**: your Windows notifications (Mail, Outlook, Teams, Discord…) in a page, plus brief popups in the notch
 - **System stats**: CPU, GPU, memory, disk and network, with live graphs
@@ -58,13 +74,14 @@ New in this build:
 
 ```powershell
 cargo build                      # debug build
-.\target\debug\nuva.exe --preview=calendar   # start expanded on a page (home, lyrics, timer, water, todo, calendar, shelf, clipboard, notifs, stats)
-.\target\debug\nuva.exe --settings           # open the settings window
+.\target\debug\nuva.exe --preview=calc   # start expanded on a page (home, lyrics, timer, water, todo, calendar, shelf, clipboard, notifs, stats, calc)
+.\target\debug\nuva.exe --settings       # open the settings window
 ```
 
 | Module | Role |
 |---|---|
 | `app.rs` | window, input, timers, alerts and wiring |
+| `cmd.rs` | command palette, calculator math engine and unit converter |
 | `notch.rs` | drawing the pill and pages |
 | `settings_window.rs` | settings UI |
 | `gfx.rs` | Direct2D/DirectWrite/DirectComposition and the canvas |

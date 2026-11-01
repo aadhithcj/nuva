@@ -117,6 +117,7 @@ pub enum W {
     Regular = 400,
     Medium = 500,
     Semi = 600,
+    Bold = 700,
 }
 
 /// Icon glyphs shared by Segoe Fluent Icons (Win 11) and Segoe MDL2 Assets (Win 10).
@@ -174,6 +175,14 @@ pub mod ico {
     pub const ART: char = '\u{E790}';
     pub const CPU: char = '\u{E950}';
     pub const GLOBE: char = '\u{E774}';
+    pub const MIC_OFF: char = '\u{EC54}';
+    pub const EYEDROPPER: char = '\u{EF3C}';
+    pub const SEARCH: char = '\u{E721}';
+    pub const CALCULATOR: char = '\u{E8EF}';
+    pub const DOWNLOAD: char = '\u{E896}';
+    pub const ZIP: char = '\u{F012}';
+    pub const CONVERT: char = '\u{E8AB}';
+    pub const SPEAKER: char = '\u{E7F5}';
 }
 
 pub fn battery_glyph(pct: u32, charging: bool) -> char {

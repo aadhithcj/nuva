@@ -16,6 +16,22 @@ pub const WM_APP_CAPS: u32 = WM_APP + 4;
 pub const WM_APP_LANGCHECK: u32 = WM_APP + 5;
 pub const WM_APP_VOLUME: u32 = WM_APP + 6;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 7;
+pub const WM_APP_COLOR_PICKED: u32 = WM_APP + 8;
+
+#[derive(Clone, Debug)]
+pub struct LiveActivityData {
+    pub title: String,
+    pub sub: String,
+    pub progress: Option<f32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct DownloadInfo {
+    pub filename: String,
+    pub size_str: String,
+    pub progress: Option<f32>,
+}
 
 pub enum Event {
     Media(crate::media::MediaState),
@@ -25,6 +41,7 @@ pub enum Event {
     Bluetooth(String, bool),
     Notifications(Vec<crate::notifications::Notif>),
     NotifIcon(String, Vec<u8>),
+    LiveActivity(Option<LiveActivityData>),
 }
 
 static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
