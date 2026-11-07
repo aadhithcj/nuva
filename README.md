@@ -1,11 +1,8 @@
-# Nuva (personal rebuild)
+# Nuva
 
 A living notch for Windows: a black pill at the top of your screen that opens on hover and shows
 music, synced lyrics, timers, reminders, files and more. Native Rust + Direct2D/DirectComposition,
 one ~0.9 MB exe, no web view, no accounts, no tracking. All data stays in your user folder.
-
-Rebuilt from scratch from a feature map of the closed-source Nusa 1.1.0
-([docs/nusa-feature-map.md](docs/nusa-feature-map.md)); none of its code is used.
 
 ## Install
 
