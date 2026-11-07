@@ -330,6 +330,29 @@ pub fn apply(a: &mut App, act: Action) {
             let p = crate::store::data_dir();
             ShellExecuteW(None, w!("open"), &HSTRING::from(p.as_os_str()), None, None, SW_SHOWNORMAL);
         },
+        Action::PageMoveUp(idx) => {
+            let mut list = a.settings.page_order_list();
+            if idx > 0 && idx < list.len() {
+                list.swap(idx, idx - 1);
+                a.settings.page_order = list.join(",");
+                a.settings.save();
+                a.settings_changed();
+            }
+        }
+        Action::PageMoveDown(idx) => {
+            let mut list = a.settings.page_order_list();
+            if idx + 1 < list.len() {
+                list.swap(idx, idx + 1);
+                a.settings.page_order = list.join(",");
+                a.settings.save();
+                a.settings_changed();
+            }
+        }
+        Action::PageResetOrder => {
+            a.settings.page_order = crate::settings::DEFAULT_PAGE_ORDER.to_string();
+            a.settings.save();
+            a.settings_changed();
+        }
         _ => {}
     }
 }
@@ -456,6 +479,42 @@ impl Form<'_> {
         self.c.text_wrap(text, Rect::new(self.x + 4.0, self.y, self.w - 8.0, h + 4.0), 11.5, W::Regular, pal::FAINT, Align::Left);
         self.y += h + 10.0;
     }
+
+    fn page_row(&mut self, idx: usize, total: usize, icon: char, title: &str, desc: &str, on: bool, toggle_key: &'static str) {
+        let r = Rect::new(self.x, self.y, self.w, ROW_H - 6.0);
+        self.c.rrect(r, 12.0, pal::CARD);
+
+        // Up button
+        let up_r = Rect::new(r.x + 8.0, r.y + 6.0, 24.0, 18.0);
+        if idx > 0 {
+            self.c.icon_button(up_r, ico::UP, 9.0, Action::PageMoveUp(idx), pal::DIM);
+        } else {
+            self.c.icon(ico::UP, up_r, 9.0, pal::FAINT);
+        }
+
+        // Down button
+        let down_r = Rect::new(r.x + 8.0, r.y + 26.0, 24.0, 18.0);
+        if idx + 1 < total {
+            self.c.icon_button(down_r, ico::DOWN, 9.0, Action::PageMoveDown(idx), pal::DIM);
+        } else {
+            self.c.icon(ico::DOWN, down_r, 9.0, pal::FAINT);
+        }
+
+        // Page icon
+        let icon_r = Rect::new(r.x + 38.0, r.y + 13.0, 26.0, 26.0);
+        self.c.icon(icon, icon_r, 14.0, if on { pal::ACCENT } else { pal::DIM });
+
+        // Title and description
+        let text_w = r.w - 120.0;
+        self.c.text(title, Rect::new(r.x + 70.0, r.y + 8.0, text_w, 20.0), 13.5, W::Medium, if on { pal::TEXT } else { pal::DIM }, Align::Left);
+        self.c.text(desc, Rect::new(r.x + 70.0, r.y + 27.0, text_w, 17.0), 11.5, W::Regular, pal::DIM, Align::Left);
+
+        // Toggle switch
+        let ctl = Rect::new(r.r() - 60.0, r.y, 44.0, r.h);
+        self.c.toggle(ctl, on, Action::SetToggle(toggle_key));
+
+        self.y += ROW_H;
+    }
 }
 
 fn bool_seg(f: &mut Form, title: &str, desc: &str, opts: [&str; 2], key: &'static str, cur: bool) {
@@ -473,7 +532,6 @@ fn general(a: &mut App, f: &mut Form) {
     let sel = sizes.iter().position(|v| *v == s.size).unwrap_or(0);
     f.seg("Size", "Scales the whole notch", &["Auto", "100%", "115%", "130%", "150%"], sel, &|i| Action::SetNum("size", sizes[i]));
     f.toggle("Minimal notch", "A smaller pill when nothing is playing", s.minimal, Action::SetToggle("minimal"));
-    f.toggle("Nuva mascot", "A little friend that lives in the notch", s.pet, Action::SetToggle("pet"));
     f.toggle("Reminder sounds", "Chimes for Pomodoro, To-do and Water", s.sound, Action::SetToggle("sound"));
     f.toggle("Hide in full screen", "Games, videos and slides that fill the screen", s.hide_fullscreen, Action::SetToggle("hide_fullscreen"));
     f.toggle("Auto-hide over windows", "Only show on top-center hover when a window is open", s.autohide_window, Action::SetToggle("autohide_window"));
@@ -515,18 +573,33 @@ fn general(a: &mut App, f: &mut Form) {
 
 fn pages_section(a: &mut App, f: &mut Form) {
     let s = a.settings.clone();
-    f.group("Active Notch Pages");
-    f.note("Choose which pages appear in the notch. Disabled pages are hidden from page dots and gestures.");
-    f.toggle("Now Playing (Music)", "Media player controls and synced lyrics", s.page_home, Action::SetToggle("page_home"));
-    f.toggle("Focus Timer", "Pomodoro with short and long breaks", s.page_timer, Action::SetToggle("page_timer"));
-    f.toggle("Water Tracker", "Water intake tracker and reminders", s.page_water, Action::SetToggle("page_water"));
-    f.toggle("To-do List", "Tasks with start and end reminders", s.page_todo, Action::SetToggle("page_todo"));
-    f.toggle("Calendar", "Month and week views with your tasks", s.page_calendar, Action::SetToggle("page_calendar"));
-    f.toggle("File Shelf", "Drop files, links and snippets", s.page_shelf, Action::SetToggle("page_shelf"));
-    f.toggle("Clipboard History", "Recent copies with pin and search", s.page_clipboard, Action::SetToggle("page_clipboard"));
-    f.toggle("Notifications", "Windows notification mirror", s.page_notifs, Action::SetToggle("page_notifs"));
-    f.toggle("System Stats", "Live CPU, GPU, RAM, disk and network graphs", s.page_stats, Action::SetToggle("page_stats"));
-    f.toggle("Calculator & Search", "Live math calculator, unit converter and app launcher", s.page_calc, Action::SetToggle("page_calc"));
+    f.group("Active Notch Pages & Order");
+    
+    // Reset order button aligned right
+    let reset_r = Rect::new(f.x + f.w - 110.0, f.y - 28.0, 110.0, 24.0);
+    f.c.button(reset_r, "Reset Order", Action::PageResetOrder, pal::CARD_HI, pal::TEXT);
+
+    f.note("Reorder and toggle pages in the notch. Click ▲ and ▼ to change the order. Disabled pages are hidden from page dots and swipe gestures.");
+
+    let order = s.page_order_list();
+    let total = order.len();
+
+    for (i, key) in order.iter().enumerate() {
+        let (title, desc, icon, on, toggle_key) = match key.as_str() {
+            "home" => ("Now Playing (Music)", "Media player controls and synced lyrics", ico::MUSIC, s.page_home, "page_home"),
+            "timer" => ("Focus Timer", "Pomodoro with short and long breaks", ico::TIMER, s.page_timer, "page_timer"),
+            "water" => ("Water Tracker", "Water intake tracker and reminders", ico::DROP, s.page_water, "page_water"),
+            "todo" => ("To-do List", "Tasks with start and end reminders", ico::CHECKLIST, s.page_todo, "page_todo"),
+            "calendar" => ("Calendar", "Month and week views with your tasks", ico::CALENDAR, s.page_calendar, "page_calendar"),
+            "shelf" => ("File Shelf", "Drop files, links and snippets", ico::FOLDER, s.page_shelf, "page_shelf"),
+            "clipboard" => ("Clipboard History", "Recent copies with pin and search", ico::CLIPBOARD, s.page_clipboard, "page_clipboard"),
+            "notifs" => ("Notifications", "Windows notification mirror", ico::BELL, s.page_notifs, "page_notifs"),
+            "stats" => ("System Stats", "Live CPU, GPU, RAM, disk and network graphs", ico::STATS, s.page_stats, "page_stats"),
+            "calc" => ("Calculator & Search", "Live math calculator, unit converter and app launcher", ico::CALCULATOR, s.page_calc, "page_calc"),
+            _ => continue,
+        };
+        f.page_row(i, total, icon, title, desc, on, toggle_key);
+    }
 }
 
 fn appearance(a: &mut App, f: &mut Form) {

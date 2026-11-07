@@ -47,6 +47,7 @@ fn main() {
         let mut activity = None;
         let mut progress = None;
         let mut notify = None;
+        let mut sub = None;
         let mut clear_act = false;
         let mut i = 1;
         while i < args.len() {
@@ -59,6 +60,9 @@ fn main() {
             } else if args[i] == "--notify" && i + 1 < args.len() {
                 notify = Some(args[i + 1].clone());
                 i += 2;
+            } else if args[i] == "--sub" && i + 1 < args.len() {
+                sub = Some(args[i + 1].clone());
+                i += 2;
             } else if args[i] == "--clear-activity" {
                 clear_act = true;
                 i += 1;
@@ -69,23 +73,47 @@ fn main() {
 
         if clear_act || activity.is_some() || notify.is_some() {
             let payload = if clear_act {
-                "clear".to_string()
+                serde_json::json!("clear")
             } else if let Some(n) = notify {
-                format!(r#"{{"notify":"{}"}}"#, n.replace('"', "\\\""))
+                serde_json::json!({
+                    "type": "notify",
+                    "title": n,
+                    "sub": sub.unwrap_or_default(),
+                })
             } else if let Some(a) = activity {
+                let mut map = serde_json::Map::new();
+                map.insert("type".into(), serde_json::Value::String("activity".into()));
+                map.insert("title".into(), serde_json::Value::String(a));
+                if let Some(s) = sub {
+                    map.insert("sub".into(), serde_json::Value::String(s));
+                }
                 if let Some(p) = progress {
                     let frac = if p > 1.0 { p / 100.0 } else { p };
-                    format!(r#"{{"title":"{}","progress":{}}}"#, a.replace('"', "\\\""), frac)
-                } else {
-                    format!(r#"{{"title":"{}"}}"#, a.replace('"', "\\\""))
+                    map.insert("progress".into(), serde_json::json!(frac));
                 }
+                serde_json::Value::Object(map)
             } else {
-                String::new()
+                serde_json::Value::Null
             };
 
+            let payload_str = payload.to_string();
+            let pipe_name = windows::core::w!(r"\\.\pipe\nuva_notch");
+            use windows::Win32::System::Pipes::WaitNamedPipeW;
+            let ready = WaitNamedPipeW(pipe_name, 1000).as_bool();
+            if !ready {
+                eprintln!("Error: Unable to connect to Nuva pipe. Is Nuva running?");
+                std::process::exit(1);
+            }
+
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(r"\\.\pipe\nuva_notch") {
-                let _ = f.write_all(payload.as_bytes());
+            match std::fs::OpenOptions::new().write(true).open(r"\\.\pipe\nuva_notch") {
+                Ok(mut f) => {
+                    let _ = f.write_all(payload_str.as_bytes());
+                }
+                Err(e) => {
+                    eprintln!("Error writing to Nuva pipe: {e}");
+                    std::process::exit(1);
+                }
             }
             return;
         }

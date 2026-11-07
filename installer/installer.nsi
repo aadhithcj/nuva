@@ -20,7 +20,7 @@ SetCompressor /SOLID lzma
 ; Setup Information
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} ${PRODUCT_VERSION} Setup"
-OutFile "..\NusaSetup.exe"
+OutFile "..\NuvaSetup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Nuva"
 InstallDirRegKey HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel user

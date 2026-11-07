@@ -15,7 +15,6 @@ pub struct Settings {
     pub size: u32,
     /// 0 = main display, else 1-based monitor index.
     pub display: u32,
-    pub pet: bool,
     pub minimal: bool,
     pub sound: bool,
     pub lyrics: bool,
@@ -63,18 +62,24 @@ pub struct Settings {
     pub page_notifs: bool,
     pub page_stats: bool,
     pub page_calc: bool,
+    pub page_order: String,
     // Header tool visibility options
     pub tool_picker: bool,
     pub tool_search: bool,
     pub tool_audio: bool,
 }
 
+pub const DEFAULT_PAGE_ORDER: &str = "home,timer,calc,water,todo,calendar,shelf,clipboard,notifs,stats";
+
+pub const ALL_PAGE_KEYS: &[&str] = &[
+    "home", "timer", "calc", "water", "todo", "calendar", "shelf", "clipboard", "notifs", "stats",
+];
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             size: 0,
             display: 0,
-            pet: true,
             minimal: false,
             sound: true,
             lyrics: true,
@@ -120,6 +125,7 @@ impl Default for Settings {
             page_notifs: true,
             page_stats: true,
             page_calc: true,
+            page_order: DEFAULT_PAGE_ORDER.to_string(),
             tool_picker: true,
             tool_search: true,
             tool_audio: true,
@@ -129,7 +135,7 @@ impl Default for Settings {
 
 /// Every boolean setting, by its file key.
 pub const BOOL_KEYS: &[&str] = &[
-    "pet", "minimal", "sound", "lyrics", "todo_start", "todo_end", "week_monday", "hud_volume",
+    "minimal", "sound", "lyrics", "todo_start", "todo_end", "week_monday", "hud_volume",
     "hud_brightness", "hud_caps", "hud_language", "popup_battery", "popup_wifi", "popup_bluetooth",
     "open_click", "page_icons", "fast_animation", "shelf_clear", "calendar_week", "hide_fullscreen",
     "water", "lyrics_pill", "clipboard", "clip_persist", "notifications", "notif_popup", "stats",
@@ -145,7 +151,12 @@ impl Settings {
         let mut s = Settings::default();
         let text = store::read("settings.txt", true);
         for (k, v) in store::kv(&text) {
-            if let Some(b) = s.bool_mut(k) {
+            if k == "pet" {
+                continue; // gracefully drop deprecated pet= key
+            }
+            if k == "page_order" {
+                s.page_order = v.to_string();
+            } else if let Some(b) = s.bool_mut(k) {
                 *b = v == "1" || v.eq_ignore_ascii_case("true");
             } else if let (Some(n), Ok(x)) = (s.num_mut(k), v.parse::<u32>()) {
                 *n = x;
@@ -164,7 +175,24 @@ impl Settings {
         for k in BOOL_KEYS {
             out += &format!("{k}={}\n", if me.bool_mut(k).map(|v| *v).unwrap_or(false) { 1 } else { 0 });
         }
+        out += &format!("page_order={}\n", self.page_order);
         store::write("settings.txt", true, &out);
+    }
+
+    pub fn page_order_list(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        for key in self.page_order.split(',') {
+            let k = key.trim();
+            if ALL_PAGE_KEYS.contains(&k) && !list.iter().any(|item: &String| item == k) {
+                list.push(k.to_string());
+            }
+        }
+        for &k in ALL_PAGE_KEYS {
+            if !list.iter().any(|item: &String| item == k) {
+                list.push(k.to_string());
+            }
+        }
+        list
     }
 
     fn clamp(&mut self) {
@@ -181,7 +209,6 @@ impl Settings {
 
     pub fn bool_mut(&mut self, key: &str) -> Option<&mut bool> {
         Some(match key {
-            "pet" => &mut self.pet,
             "minimal" => &mut self.minimal,
             "sound" => &mut self.sound,
             "lyrics" => &mut self.lyrics,
@@ -287,5 +314,43 @@ pub fn set_startup(on: bool) {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from("Nuva"));
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from("Nusa"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_order_default() {
+        let s = Settings::default();
+        let list = s.page_order_list();
+        assert_eq!(list.len(), ALL_PAGE_KEYS.len());
+        assert_eq!(list[0], "home");
+        assert_eq!(list[1], "timer");
+    }
+
+    #[test]
+    fn test_page_order_custom() {
+        let mut s = Settings::default();
+        s.page_order = "todo,calc,home".into();
+        let list = s.page_order_list();
+        assert_eq!(list.len(), ALL_PAGE_KEYS.len());
+        assert_eq!(list[0], "todo");
+        assert_eq!(list[1], "calc");
+        assert_eq!(list[2], "home");
+        assert!(list.contains(&"stats".to_string()));
+        assert!(list.contains(&"calendar".to_string()));
+    }
+
+    #[test]
+    fn test_page_order_filters_unknown() {
+        let mut s = Settings::default();
+        s.page_order = "search,unknown_page,home,timer".into();
+        let list = s.page_order_list();
+        assert_eq!(list[0], "home");
+        assert_eq!(list[1], "timer");
+        assert!(!list.contains(&"search".to_string()));
+        assert!(!list.contains(&"unknown_page".to_string()));
     }
 }

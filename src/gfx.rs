@@ -65,6 +65,9 @@ impl Rect {
 pub struct Color(pub f32, pub f32, pub f32, pub f32);
 
 impl Color {
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+    }
     pub const fn hex(v: u32) -> Color {
         Color(
             ((v >> 16) & 0xff) as f32 / 255.0,
@@ -175,6 +178,8 @@ pub mod ico {
     pub const ART: char = '\u{E790}';
     pub const CPU: char = '\u{E950}';
     pub const GLOBE: char = '\u{E774}';
+    pub const LOCK: char = '\u{E72E}';
+    pub const MOON: char = '\u{E708}';
     pub const MIC_OFF: char = '\u{EC54}';
     pub const EYEDROPPER: char = '\u{EF3C}';
     pub const SEARCH: char = '\u{E721}';
@@ -293,6 +298,33 @@ impl Gfx {
             // Materialise so the decoder/stream (and `bytes`) are no longer needed.
             let bmp = self.wic.CreateBitmapFromSource(&conv, WICBitmapCacheOnLoad).ok()?;
             bmp.cast().ok()
+        }
+    }
+
+    pub fn decode_bgra_pixels(&self, bytes: &[u8], max_px: u32) -> Option<(u32, u32, Vec<u8>)> {
+        unsafe {
+            let stream = self.wic.CreateStream().ok()?;
+            stream.InitializeFromMemory(bytes).ok()?;
+            let dec = self.wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnLoad).ok()?;
+            let frame = dec.GetFrame(0).ok()?;
+            let (mut w, mut h) = (0u32, 0u32);
+            frame.GetSize(&mut w, &mut h).ok()?;
+            let mut src: IWICBitmapSource = frame.cast().ok()?;
+            if w > max_px || h > max_px {
+                let s = max_px as f32 / w.max(h) as f32;
+                let target_w = ((w as f32 * s) as u32).max(1);
+                let target_h = ((h as f32 * s) as u32).max(1);
+                let scaler = self.wic.CreateBitmapScaler().ok()?;
+                scaler.Initialize(&src, target_w, target_h, WICBitmapInterpolationModeHighQualityCubic).ok()?;
+                src = scaler.cast().ok()?;
+                w = target_w;
+                h = target_h;
+            }
+            let conv = self.wic.CreateFormatConverter().ok()?;
+            conv.Initialize(&src, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut).ok()?;
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            conv.CopyPixels(std::ptr::null(), w * 4, &mut buf).ok()?;
+            Some((w, h, buf))
         }
     }
 }
@@ -457,6 +489,7 @@ impl Canvas {
         unsafe { self.rt.FillEllipse(&e, self.b(c)) };
     }
 
+    #[allow(dead_code)]
     pub fn ellipse(&self, cx: f32, cy: f32, rx: f32, ry: f32, c: Color) {
         let e = D2D1_ELLIPSE { point: pt(cx, cy), radiusX: rx, radiusY: ry };
         unsafe { self.rt.FillEllipse(&e, self.b(c)) };

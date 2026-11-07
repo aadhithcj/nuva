@@ -11,7 +11,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const ID_SETTINGS: usize = 100;
 pub const ID_STARTUP: usize = 101;
-pub const ID_PET: usize = 102;
 pub const ID_MINIMAL: usize = 103;
 pub const ID_ABOUT: usize = 104;
 pub const ID_QUIT: usize = 105;
@@ -170,7 +169,6 @@ pub fn show_menu(hwnd: HWND, s: &Settings) {
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING | check(crate::settings::startup_enabled()), ID_STARTUP, w!("Start with Windows"));
-        let _ = AppendMenuW(menu, MF_STRING | check(s.pet), ID_PET, w!("Nuva Mascot"));
         let _ = AppendMenuW(menu, MF_STRING | check(s.minimal), ID_MINIMAL, w!("Minimal notch"));
         if let Ok(sub) = CreatePopupMenu() {
             for (i, v) in SIZES.iter().enumerate() {

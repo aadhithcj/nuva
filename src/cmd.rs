@@ -4,6 +4,7 @@ pub struct CommandPalette {
     pub query: String,
     pub result: Option<CommandItem>,
     pub active: bool,
+    pub confirm_cmd: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -29,27 +30,32 @@ impl CommandPalette {
             query: String::new(),
             result: None,
             active: false,
+            confirm_cmd: None,
         }
     }
 
     #[allow(dead_code)]
     pub fn set_query(&mut self, q: String) {
         self.query = q;
+        self.confirm_cmd = None;
         self.update();
     }
 
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
+        self.confirm_cmd = None;
         self.update();
     }
 
     pub fn backspace(&mut self) {
         self.query.pop();
+        self.confirm_cmd = None;
         self.update();
     }
 
     pub fn clear(&mut self) {
         self.query.clear();
+        self.confirm_cmd = None;
         self.result = None;
     }
 
@@ -60,20 +66,26 @@ impl CommandPalette {
             return;
         }
 
-        // 1. Try Unit Conversion (e.g. "50 km to mi", "100 c to f")
+        // 1. Try Date Math (e.g. "days until 25 dec", "days to new year")
+        if let Some(res) = eval_date(q) {
+            self.result = Some(res);
+            return;
+        }
+
+        // 2. Try Unit Conversion (e.g. "50 km to mi", "100 c to f")
         if let Some(res) = eval_units(q) {
             self.result = Some(res);
             return;
         }
 
-        // 2. Try Math Evaluation (e.g. "124 * 1.18", "sqrt(144) + 10")
+        // 3. Try Math Evaluation (e.g. "124 * 1.18", "sqrt(144) + 10")
         if let Some(res) = eval_math(q) {
             self.result = Some(res);
             return;
         }
 
-        // 3. Try App Launch / Navigation / Actions
-        if let Some(res) = eval_command(q) {
+        // 4. Try App Launch / Navigation / Actions / Start Menu
+        if let Some(res) = eval_command(q, self.confirm_cmd.as_deref()) {
             self.result = Some(res);
             return;
         }
@@ -108,7 +120,8 @@ fn eval_math(input: &str) -> Option<CommandItem> {
     let s = input.replace(' ', "").to_lowercase();
     let has_op = s.contains('+') || s.contains('-') || s.contains('*') || s.contains('/')
         || s.contains('^') || s.contains('%') || s.contains("sqrt") || s.contains("sin")
-        || s.contains("cos") || s.contains("tan") || s.contains("abs");
+        || s.contains("cos") || s.contains("tan") || s.contains("abs") || s.contains("floor")
+        || s.contains("ceil") || s.contains("pi") || s.contains('(');
     if !has_op && !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
     }
@@ -120,7 +133,9 @@ fn eval_math(input: &str) -> Option<CommandItem> {
     let formatted = if val.fract().abs() < 1e-9 {
         format!("{}", val as i64)
     } else {
-        format!("{:.4}", val).trim_end_matches('0').trim_end_matches('.').to_string()
+        let rounded = format!("{:.12}", val);
+        let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+        trimmed.to_string()
     };
 
     Some(CommandItem {
@@ -325,9 +340,47 @@ fn convert_unit(v: f64, from: &str, to: &str) -> Option<(f64, &'static str)> {
 
 // ---------------------------------------------------------------- command launcher
 
-fn eval_command(q: &str) -> Option<CommandItem> {
+fn eval_command(q: &str, confirm_cmd: Option<&str>) -> Option<CommandItem> {
     let lower = q.to_lowercase();
     match lower.as_str() {
+        "lock" => Some(CommandItem {
+            title: "Lock Workstation".into(),
+            sub: "Lock Windows immediately".into(),
+            icon: crate::gfx::ico::LOCK,
+            kind: CommandKind::Launch("rundll32.exe user32.dll,LockWorkStation".into()),
+        }),
+        "sleep" => Some(CommandItem {
+            title: "Sleep PC".into(),
+            sub: "Put computer to sleep".into(),
+            icon: crate::gfx::ico::MOON,
+            kind: CommandKind::Launch("rundll32.exe powrprof.dll,SetSuspendState 0,1,0".into()),
+        }),
+        "shutdown" => {
+            let confirmed = confirm_cmd == Some("shutdown");
+            Some(CommandItem {
+                title: if confirmed { "Confirm Shutdown" } else { "Shut Down PC" }.into(),
+                sub: if confirmed { "⚠️ Press Enter again to shut down immediately" } else { "Press Enter once to confirm" }.into(),
+                icon: crate::gfx::ico::CLOSE,
+                kind: if confirmed {
+                    CommandKind::Launch("shutdown.exe /s /t 0".into())
+                } else {
+                    CommandKind::Action(crate::ui::Action::CommandConfirm("shutdown".into()))
+                },
+            })
+        }
+        "restart" => {
+            let confirmed = confirm_cmd == Some("restart");
+            Some(CommandItem {
+                title: if confirmed { "Confirm Restart" } else { "Restart PC" }.into(),
+                sub: if confirmed { "⚠️ Press Enter again to restart immediately" } else { "Press Enter once to confirm" }.into(),
+                icon: crate::gfx::ico::REFRESH,
+                kind: if confirmed {
+                    CommandKind::Launch("shutdown.exe /r /t 0".into())
+                } else {
+                    CommandKind::Action(crate::ui::Action::CommandConfirm("restart".into()))
+                },
+            })
+        }
         "calc" | "calculator" => Some(CommandItem {
             title: "Open Windows Calculator".into(),
             sub: "Launch calc.exe".into(),
@@ -424,6 +477,205 @@ fn eval_command(q: &str) -> Option<CommandItem> {
             icon: crate::gfx::ico::STATS,
             kind: CommandKind::Page(8),
         }),
+        _ => {
+            // Check indexed Start Menu apps
+            for (name, path) in start_menu_apps() {
+                if name.to_lowercase() == lower || name.to_lowercase().starts_with(&lower) {
+                    return Some(CommandItem {
+                        title: name.clone(),
+                        sub: format!("Launch {name}"),
+                        icon: crate::gfx::ico::SEARCH,
+                        kind: CommandKind::Launch(path.clone()),
+                    });
+                }
+            }
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Start Menu indexing
+
+static START_MENU_APPS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+fn start_menu_apps() -> &'static [(String, String)] {
+    START_MENU_APPS.get_or_init(|| {
+        let mut apps = Vec::new();
+        let mut dirs = Vec::new();
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            dirs.push(std::path::PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs"));
+        }
+        if let Ok(progdata) = std::env::var("PROGRAMDATA") {
+            dirs.push(std::path::PathBuf::from(progdata).join(r"Microsoft\Windows\Start Menu\Programs"));
+        }
+        for dir in dirs {
+            scan_lnk_dir(&dir, &mut apps);
+        }
+        apps
+    })
+}
+
+fn scan_lnk_dir(dir: &std::path::Path, apps: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            scan_lnk_dir(&p, apps);
+        } else if p.extension().and_then(|e| e.to_str()).unwrap_or("").eq_ignore_ascii_case("lnk") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.to_lowercase().contains("uninstall") {
+                    apps.push((stem.to_string(), p.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- date math
+
+fn eval_date(input: &str) -> Option<CommandItem> {
+    let lower = input.to_lowercase();
+    let s = lower.trim();
+    if !s.starts_with("days to ") && !s.starts_with("days until ") {
+        return None;
+    }
+    let target_str = s.trim_start_matches("days to ").trim_start_matches("days until ").trim();
+    let now = crate::time::now();
+    let today = crate::time::today();
+
+    let target_day = match target_str {
+        "new year" | "new year's" | "new years" => {
+            Some(crate::time::days_from_civil(now.year + 1, 1, 1))
+        }
+        "christmas" | "xmas" => {
+            let mut d = crate::time::days_from_civil(now.year, 12, 25);
+            if d < today {
+                d = crate::time::days_from_civil(now.year + 1, 12, 25);
+            }
+            Some(d)
+        }
+        other => parse_month_day(other, now.year, today),
+    }?;
+
+    let diff = target_day - today;
+    let text = match diff {
+        0 => "Today!".to_string(),
+        1 => "Tomorrow (1 day)".to_string(),
+        n if n > 0 => format!("{n} days"),
+        n => format!("{} days ago", n.abs()),
+    };
+
+    Some(CommandItem {
+        title: format!("= {text}"),
+        sub: format!("{input} • Press Enter to copy"),
+        icon: crate::gfx::ico::CALENDAR,
+        kind: CommandKind::Copy(text),
+    })
+}
+
+fn parse_month_day(s: &str, cur_year: i32, today: i64) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let (m, d) = if let Ok(day) = parts[0].trim_end_matches("st").trim_end_matches("nd").trim_end_matches("rd").trim_end_matches("th").parse::<u32>() {
+        let month = month_from_str(parts[1])?;
+        (month, day)
+    } else if let Ok(day) = parts[1].trim_end_matches("st").trim_end_matches("nd").trim_end_matches("rd").trim_end_matches("th").parse::<u32>() {
+        let month = month_from_str(parts[0])?;
+        (month, day)
+    } else {
+        return None;
+    };
+
+    if d < 1 || d > 31 {
+        return None;
+    }
+
+    let d_this_year = crate::time::days_from_civil(cur_year, m, d);
+    if d_this_year >= today {
+        Some(d_this_year)
+    } else {
+        Some(crate::time::days_from_civil(cur_year + 1, m, d))
+    }
+}
+
+fn month_from_str(s: &str) -> Option<u32> {
+    match s {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eval_math_basic() {
+        assert_eq!(eval_math("1 + 2").unwrap().title, "= 3");
+        assert_eq!(eval_math("10 - 4").unwrap().title, "= 6");
+        assert_eq!(eval_math("6 * 7").unwrap().title, "= 42");
+        assert_eq!(eval_math("100 / 4").unwrap().title, "= 25");
+        assert_eq!(eval_math("2 ^ 8").unwrap().title, "= 256");
+    }
+
+    #[test]
+    fn test_eval_math_floating_rounding() {
+        // Must round clean without 0.30000000000000004
+        assert_eq!(eval_math("0.1 + 0.2").unwrap().title, "= 0.3");
+        assert_eq!(eval_math("0.05 + 0.05").unwrap().title, "= 0.1");
+    }
+
+    #[test]
+    fn test_eval_math_functions() {
+        assert_eq!(eval_math("sqrt(144)").unwrap().title, "= 12");
+        assert_eq!(eval_math("abs(-42)").unwrap().title, "= 42");
+        assert_eq!(eval_math("floor(3.9)").unwrap().title, "= 3");
+        assert_eq!(eval_math("ceil(3.1)").unwrap().title, "= 4");
+    }
+
+    #[test]
+    fn test_eval_math_malformed_no_panics() {
+        assert!(eval_math("10 / 0").is_none());
+        assert!(eval_math("10 % 0").is_none());
+        assert!(eval_math("sqrt(-1)").is_none());
+        assert!(eval_math("((1 + 2)").is_none());
+        assert!(eval_math("10 +* 5").is_none());
+        assert!(eval_math("").is_none());
+        assert!(eval_math("hello world").is_none());
+    }
+
+    #[test]
+    fn test_unit_conversions() {
+        assert!(eval_units("50 km to mi").is_some());
+        assert!(eval_units("100 c to f").is_some());
+        assert!(eval_units("10 kg to lb").is_some());
+        assert!(eval_units("24 hours to min").is_some());
+        assert!(eval_units("invalid to bogus").is_none());
+    }
+
+    #[test]
+    fn test_date_math() {
+        assert!(eval_date("days to new year").is_some());
+        assert!(eval_date("days until christmas").is_some());
+        assert!(eval_date("days until 25 dec").is_some());
+        assert!(eval_date("days until dec 25").is_some());
+        assert!(eval_date("days until 29 feb").is_some());
+        assert!(eval_date("random text").is_none());
     }
 }

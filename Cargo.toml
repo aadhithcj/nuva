@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 serde_json = "1"
 windows-core = "0.58"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dependencies.windows]
 version = "0.58"
@@ -22,6 +23,8 @@ features = [
     "Foundation_Numerics",
     "ApplicationModel",
     "Media_Control",
+    "Media_Ocr",
+    "Graphics_Imaging",
     "Storage_Streams",
     "Web_Http",
     "Web_Http_Headers",

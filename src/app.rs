@@ -51,7 +51,6 @@ const T_OPEN: usize = 3;
 const T_CLOSE: usize = 4;
 const T_LYRIC: usize = 5;
 const T_NET: usize = 6;
-const T_BLINK: usize = 7;
 const T_LANG: usize = 8;
 const T_EDGE_POLL: usize = 9;
 const T_VOLUME_COOLDOWN: usize = 10;
@@ -123,13 +122,6 @@ pub enum View {
     Open(Page),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Pet {
-    Off,
-    Awake,
-    Dozing,
-    Waving,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToastKind {
@@ -226,6 +218,8 @@ pub struct App {
     media_ctl: Media,
     art_src: Option<IWICBitmapSource>,
     art_key: String,
+    pub media_accent: Option<Color>,
+    pub audio_spectrum: [f32; 5],
     pub show_split: bool,
     pub lyrics: Option<Lyrics>,
     pub lyrics_loading: bool,
@@ -249,9 +243,8 @@ pub struct App {
     pub stats: Stats,
     pub alerts: VecDeque<Alert>,
     pub toast: Option<Toast>,
-    pub pet: Pet,
-    pub blink_until: Option<Instant>,
-    wave_until: Option<Instant>,
+    pub drop_action_zone: Option<crate::shelf::DropAction>,
+    pub drag_has_images: bool,
     volume: Option<Volume>,
     battery: Battery,
     pending_net: Option<NetState>,
@@ -274,6 +267,7 @@ pub struct App {
     pub live_activity: Option<crate::events::LiveActivityData>,
     pub download: Option<crate::events::DownloadInfo>,
     pub last_volume_scroll: Option<Instant>,
+    pub close_deadline: Option<Instant>,
 }
 
 static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
@@ -350,6 +344,8 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             media_ctl,
             art_src: None,
             art_key: String::new(),
+            media_accent: None,
+            audio_spectrum: [0.0; 5],
             show_split: false,
             lyrics: None,
             lyrics_loading: false,
@@ -373,9 +369,8 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             stats: Stats::new(),
             alerts: VecDeque::new(),
             toast: None,
-            pet: Pet::Off,
-            blink_until: None,
-            wave_until: None,
+            drop_action_zone: None,
+            drag_has_images: false,
             volume: None,
             battery: system::battery(),
             pending_net: None,
@@ -398,6 +393,7 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             live_activity: None,
             download: None,
             last_volume_scroll: None,
+            close_deadline: None,
             settings,
         });
         app.cal_reset();
@@ -577,18 +573,6 @@ impl App {
         moving |= self.sr.step(dt, k, 0.9);
         moving |= self.fade.step(dt, k * 1.2, 1.0);
         moving |= self.lyric_scroll.step(dt, 180.0, 1.0);
-        if let Some(b) = self.blink_until {
-            if now < b {
-                moving = true;
-            } else {
-                self.blink_until = None;
-                self.dirty = true;
-            }
-        }
-        // The waving hand animates for its short lifetime.
-        if self.pet == Pet::Waving && view == View::Pill {
-            moving = true;
-        }
         if moving || self.dirty {
             self.dirty = false;
             self.render();
@@ -614,7 +598,6 @@ impl App {
         }
         self.last_view = v;
         self.schedule_lyric_timer();
-        self.update_blink_timer();
     }
 
     fn render(&mut self) {
@@ -684,39 +667,30 @@ impl App {
         Rect::new(WIN_W / 2.0 - self.sw.v / 2.0, 0.0, self.sw.v, self.sh.v)
     }
 
+    pub fn dropzone_rect(r: Rect, i: usize) -> Rect {
+        let gap = 8.0;
+        let card_w = (r.w - 3.0 * gap) / 4.0;
+        Rect::new(r.x + i as f32 * (card_w + gap), r.y, card_w, r.h)
+    }
+
     // ------------------------------------------------ what to show
 
     pub fn pages(&self) -> Vec<Page> {
         let mut v = Vec::new();
-        if self.settings.page_home {
-            v.push(Page::Home);
-        }
-        if self.settings.page_timer {
-            v.push(Page::Timer);
-        }
-        if self.settings.water && self.settings.page_water {
-            v.push(Page::Water);
-        }
-        if self.settings.page_todo {
-            v.push(Page::Todo);
-        }
-        if self.settings.page_calendar {
-            v.push(Page::Calendar);
-        }
-        if self.settings.page_shelf {
-            v.push(Page::Shelf);
-        }
-        if self.settings.clipboard && self.settings.page_clipboard {
-            v.push(Page::Clipboard);
-        }
-        if self.settings.notifications && self.settings.page_notifs {
-            v.push(Page::Notifs);
-        }
-        if self.settings.stats && self.settings.page_stats {
-            v.push(Page::Stats);
-        }
-        if self.settings.page_calc {
-            v.push(Page::Calc);
+        for key in self.settings.page_order_list() {
+            match key.as_str() {
+                "home" => if self.settings.page_home { v.push(Page::Home); },
+                "timer" => if self.settings.page_timer { v.push(Page::Timer); },
+                "water" => if self.settings.water && self.settings.page_water { v.push(Page::Water); },
+                "todo" => if self.settings.page_todo { v.push(Page::Todo); },
+                "calendar" => if self.settings.page_calendar { v.push(Page::Calendar); },
+                "shelf" => if self.settings.page_shelf { v.push(Page::Shelf); },
+                "clipboard" => if self.settings.clipboard && self.settings.page_clipboard { v.push(Page::Clipboard); },
+                "notifs" => if self.settings.notifications && self.settings.page_notifs { v.push(Page::Notifs); },
+                "stats" => if self.settings.stats && self.settings.page_stats { v.push(Page::Stats); },
+                "calc" => if self.settings.page_calc { v.push(Page::Calc); },
+                _ => {}
+            }
         }
         if v.is_empty() {
             v.push(Page::Home);
@@ -770,7 +744,9 @@ impl App {
                 }
                 unsafe {
                     let _ = KillTimer(self.hwnd, T_OPEN);
-                    SetTimer(self.hwnd, T_CLOSE, 280, None);
+                }
+                if self.close_deadline.is_none() {
+                    self.close_deadline = Some(Instant::now() + Duration::from_millis(280));
                 }
                 self.request_frame();
             }
@@ -920,10 +896,6 @@ impl App {
                     self.show_network(s);
                 }
             }
-            T_BLINK => {
-                self.blink_until = Some(Instant::now() + Duration::from_millis(160));
-                self.request_frame();
-            }
             T_LANG => {
                 unsafe {
                     let _ = KillTimer(self.hwnd, T_LANG);
@@ -980,6 +952,7 @@ impl App {
     fn on_mouse_move(&mut self, x: f32, y: f32) {
         self.mouse = Some((x, y));
         self.window_hovered = true;
+        self.close_deadline = None;
         if !self.tracking {
             self.tracking = true;
             let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
@@ -1249,7 +1222,6 @@ impl App {
         match id {
             tray::ID_SETTINGS => self.open_settings(),
             tray::ID_STARTUP => settings::set_startup(!settings::startup_enabled()),
-            tray::ID_PET => self.toggle_setting("pet"),
             tray::ID_MINIMAL => self.toggle_setting("minimal"),
             tray::ID_ABOUT => {
                 self.open_settings();
@@ -1311,7 +1283,6 @@ impl App {
                     let _ = SetWindowDisplayAffinity(self.hwnd, WINDOW_DISPLAY_AFFINITY(if self.settings.exclude_capture { 17 } else { 0 }));
                 }
             }
-            "pet" => self.update_pet(),
             _ => {}
         }
         self.settings_changed();
@@ -1515,6 +1486,11 @@ impl App {
                 self.cmd.backspace();
                 self.request_frame();
             }
+            Action::CommandConfirm(cmd) => {
+                self.cmd.confirm_cmd = Some(cmd);
+                self.cmd.update();
+                self.request_frame();
+            }
             Action::CommandRun => {
                 if let Some(item) = self.cmd.result.clone() {
                     match item.kind {
@@ -1650,6 +1626,9 @@ impl App {
             return;
         }
 
+        // Periodic desktop detection check
+        self.check_desktop_state();
+
         // Stale alerts fall away after two minutes.
         if let Some(a) = self.alerts.front() {
             if a.created.elapsed() > Duration::from_secs(120) {
@@ -1729,12 +1708,6 @@ impl App {
             }
         }
 
-        let before = self.pet;
-        self.update_pet();
-        if before != self.pet {
-            dirty = true;
-        }
-
         if self.tick_n % 2 == 0 {
             self.check_fullscreen();
             self.check_desktop_state();
@@ -1754,48 +1727,6 @@ impl App {
         }
         if dirty {
             self.request_frame();
-        }
-    }
-
-    fn update_pet(&mut self) {
-        let idle = system::idle_secs();
-        let busy = self.media.playing || self.pomo.running || self.expanded;
-        let new = if !self.settings.pet || busy {
-            Pet::Off
-        } else if idle >= 300 {
-            Pet::Dozing
-        } else if idle >= 60 {
-            Pet::Awake
-        } else if let Some(t) = self.wave_until {
-            if Instant::now() < t {
-                Pet::Waving
-            } else {
-                self.wave_until = None;
-                Pet::Off
-            }
-        } else if matches!(self.pet, Pet::Awake | Pet::Dozing) {
-            // Welcome back.
-            self.wave_until = Some(Instant::now() + Duration::from_millis(2600));
-            Pet::Waving
-        } else {
-            Pet::Off
-        };
-        if new != self.pet {
-            self.pet = new;
-            self.update_blink_timer();
-            if new == Pet::Waving {
-                self.request_frame();
-            }
-        }
-    }
-
-    fn update_blink_timer(&self) {
-        unsafe {
-            if self.pet == Pet::Awake && self.last_view == View::Pill {
-                SetTimer(self.hwnd, T_BLINK, 4200, None);
-            } else {
-                let _ = KillTimer(self.hwnd, T_BLINK);
-            }
         }
     }
 
@@ -1856,14 +1787,13 @@ impl App {
         let was_desktop = self.is_desktop;
         self.is_desktop = system::is_desktop_homescreen(&self.monitor, self.hwnd);
         if self.is_desktop != was_desktop {
-            if !self.is_desktop && !self.cursor_in_notch() {
-                self.window_hovered = false;
-                self.expand(false);
+            if self.is_desktop {
+                self.close_deadline = None;
+            } else if !self.cursor_in_notch() {
+                if self.close_deadline.is_none() {
+                    self.close_deadline = Some(Instant::now() + Duration::from_millis(280));
+                }
             }
-            self.request_frame();
-        } else if !self.is_desktop && !self.cursor_in_notch() && (self.window_hovered || self.expanded) {
-            self.window_hovered = false;
-            self.expand(false);
             self.request_frame();
         }
     }
@@ -1886,6 +1816,7 @@ impl App {
         let in_y = p.y >= mon.top && p.y <= mon.top + 4;
 
         if in_x && in_y {
+            self.close_deadline = None;
             if !self.window_hovered {
                 self.window_hovered = true;
                 self.request_frame();
@@ -1896,12 +1827,37 @@ impl App {
     fn on_edge_poll(&mut self) {
         self.check_top_hover();
 
-        if self.window_hovered && !self.is_desktop && !self.expanded && !self.tracking && self.toast.is_none() && self.alerts.is_empty() {
-            if !self.cursor_in_notch() {
-                unsafe {
-                    SetTimer(self.hwnd, T_CLOSE, 280, None);
+        let editing = self.editor.as_ref().map(|e| e.focused).unwrap_or(false);
+        let busy = editing || self.seeking.is_some() || self.drag_over || !self.alerts.is_empty() || self.toast.is_some() || self.preview;
+
+        let should_auto_close = if self.is_desktop {
+            self.expanded
+        } else {
+            self.window_hovered || self.expanded
+        };
+
+        if should_auto_close && !busy {
+            if self.cursor_in_notch() {
+                self.close_deadline = None;
+            } else {
+                match self.close_deadline {
+                    None => {
+                        self.close_deadline = Some(Instant::now() + Duration::from_millis(280));
+                    }
+                    Some(deadline) => {
+                        if Instant::now() >= deadline {
+                            self.close_deadline = None;
+                            self.expand(false);
+                            if !self.is_desktop {
+                                self.window_hovered = false;
+                            }
+                            self.request_frame();
+                        }
+                    }
                 }
             }
+        } else if self.cursor_in_notch() || busy {
+            self.close_deadline = None;
         }
 
         let fg = unsafe { GetForegroundWindow() };
@@ -1983,19 +1939,24 @@ impl App {
                 if changed_track {
                     if self.art_key != self.media.key() {
                         self.art_src = None;
+                        self.media_accent = None;
                         self.bmp_cache.remove("art");
                     }
                     self.lyrics = None;
                     self.lyric_scroll.snap(0.0);
                     self.maybe_fetch_lyrics();
                 }
-                self.update_pet();
                 self.schedule_lyric_timer();
                 self.request_frame();
             }
             Event::MediaArt(key, bytes) => {
                 if key == self.media.key() {
                     self.art_src = self.gfx.decode(&bytes, 256);
+                    if let Some((_, _, px)) = self.gfx.decode_bgra_pixels(&bytes, 64) {
+                        if let Some((r, g, b)) = crate::media::extract_vibrant_accent(&px) {
+                            self.media_accent = Some(Color::rgb(r, g, b));
+                        }
+                    }
                     self.art_key = key;
                     self.bmp_cache.remove("art");
                     self.request_frame();
@@ -2060,6 +2021,38 @@ impl App {
                 self.live_activity = act;
                 self.request_frame();
             }
+            Event::AudioSpectrum(bands) => {
+                self.audio_spectrum = bands;
+                if self.media.playing {
+                    self.request_frame();
+                }
+            }
+            Event::NotificationToast { title, sub } => {
+                self.show_toast(ToastKind::Notification, ico::INFO, pal::ACCENT, &title, &sub, None, 3.5);
+            }
+            Event::ShelfImageConverted { old_path, new_path } => {
+                self.shelf.replace_or_add(old_path, new_path.clone());
+                let name = new_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "image".into());
+                self.show_toast(ToastKind::Info, ico::CONVERT, pal::GREEN, "Image Converted", &name, None, 3.0);
+            }
+            Event::ShelfOcrSuccess { path: _, text } => {
+                crate::app::copy_text(self.hwnd, &text);
+                let preview = if text.len() > 30 {
+                    format!("{}…", &text[..30])
+                } else {
+                    text
+                };
+                self.show_toast(ToastKind::Info, ico::SEARCH, pal::ACCENT, "Text Copied via OCR", &preview, None, 3.0);
+            }
+            Event::ShelfZipCreated { path } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "archive.zip".into());
+                self.shelf.add_file(path);
+                self.show_toast(ToastKind::Info, ico::ZIP, pal::ACCENT, "ZIP Archive Created", &name, None, 3.0);
+            }
+            Event::ShelfActionFailed(reason) => {
+                self.show_toast(ToastKind::Info, ico::CLOSE, pal::RED, "Shelf Action Failed", &reason, None, 3.0);
+            }
+            Event::ColorHover(_) | Event::ColorPicked(_, _, _) | Event::ColorCanceled => {}
         }
     }
 
@@ -2103,13 +2096,53 @@ impl App {
 
     pub fn drag_enter(&mut self) {
         self.drag_over = true;
+        self.drop_action_zone = Some(crate::shelf::DropAction::Hold);
         self.page = Page::Shelf;
         self.expanded = true;
         self.request_frame();
     }
 
+    pub fn drag_over_pt(&mut self, screen_x: i32, screen_y: i32) {
+        let scale = self.scale.max(1.0);
+        let x = (screen_x - self.win_px.0) as f32 / scale;
+        let y = (screen_y - self.win_px.1) as f32 / scale;
+
+        let a = self.notch_rect();
+        let r = Rect::new(a.x + 20.0, 36.0, (a.w - 40.0).max(10.0), (a.h - 64.0).max(10.0));
+        
+        let mut chosen_col = None;
+        for i in 0..4 {
+            let card = Self::dropzone_rect(r, i);
+            if card.contains((x, y)) {
+                chosen_col = Some(i);
+                break;
+            }
+        }
+        let mut col = chosen_col.unwrap_or_else(|| {
+            let rel = (x - r.x) / r.w.max(1.0);
+            ((rel * 4.0).floor() as i32).clamp(0, 3) as usize
+        });
+
+        if !self.drag_has_images && (col == 1 || col == 3) {
+            col = 0;
+        }
+
+        let action = match col {
+            0 => crate::shelf::DropAction::Hold,
+            1 => crate::shelf::DropAction::Convert,
+            2 => crate::shelf::DropAction::Compress,
+            _ => crate::shelf::DropAction::Ocr,
+        };
+        if self.drop_action_zone != Some(action) {
+            self.drop_action_zone = Some(action);
+            self.request_frame();
+        }
+    }
+
     pub fn drag_leave(&mut self) {
         self.drag_over = false;
+        self.drop_action_zone = None;
+        self.drag_has_images = false;
         unsafe {
             SetTimer(self.hwnd, T_CLOSE, 400, None);
         }
@@ -2118,10 +2151,32 @@ impl App {
 
     pub fn dropped(&mut self, d: Option<Dropped>) {
         self.drag_over = false;
+        let action = self.drop_action_zone.take().unwrap_or(crate::shelf::DropAction::Hold);
         match d {
-            Some(Dropped::Files(f)) => {
-                for p in f {
-                    self.shelf.add_file(p);
+            Some(Dropped::Files(files)) => {
+                if files.is_empty() {
+                    return;
+                }
+                match action {
+                    crate::shelf::DropAction::Hold => {
+                        for p in files {
+                            self.shelf.add_file(p);
+                        }
+                    }
+                    crate::shelf::DropAction::Convert => {
+                        for p in files {
+                            self.shelf.add_file(p.clone());
+                            crate::shelf::convert_image_async(p);
+                        }
+                    }
+                    crate::shelf::DropAction::Compress => {
+                        crate::shelf::compress_files_async(files);
+                    }
+                    crate::shelf::DropAction::Ocr => {
+                        for p in files {
+                            crate::shelf::extract_text_from_image_async(p);
+                        }
+                    }
                 }
             }
             Some(Dropped::Text(t)) => self.shelf.add_text(&t),

@@ -311,6 +311,7 @@ pub fn monitors() -> Vec<Monitor> {
     v
 }
 
+#[allow(dead_code)]
 pub fn idle_secs() -> u32 {
     let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
     unsafe {
@@ -635,10 +636,10 @@ pub fn start_pipe_listener() {
                 let pipe = CreateNamedPipeW(
                     pipe_name,
                     PIPE_ACCESS_INBOUND,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     PIPE_UNLIMITED_INSTANCES,
-                    1024,
-                    1024,
+                    65536,
+                    65536,
                     0,
                     None,
                 );
@@ -647,7 +648,7 @@ pub fn start_pipe_listener() {
                     continue;
                 }
                 if ConnectNamedPipe(pipe, None).is_ok() {
-                    let mut buf = [0u8; 1024];
+                    let mut buf = vec![0u8; 65536];
                     let mut read = 0u32;
                     if ReadFile(HANDLE(pipe.0), Some(&mut buf), Some(&mut read), None).is_ok() && read > 0 {
                         let text = String::from_utf8_lossy(&buf[..read as usize]);
@@ -668,13 +669,11 @@ fn handle_pipe_message(text: &str) {
         return;
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(notify) = v.get("notify").and_then(|n| n.as_str()) {
-            let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
-            events::push(events::Event::LiveActivity(Some(events::LiveActivityData {
-                title: notify.to_string(),
-                sub: sub.to_string(),
-                progress: None,
-            })));
+        let is_notify = v.get("type").and_then(|t| t.as_str()) == Some("notify") || v.get("notify").is_some();
+        if is_notify {
+            let title = v.get("title").or_else(|| v.get("notify")).and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            events::push(events::Event::NotificationToast { title, sub });
         } else if let Some(title) = v.get("title").and_then(|t| t.as_str()) {
             let sub = v.get("sub").and_then(|s| s.as_str()).unwrap_or("");
             let progress = v.get("progress").and_then(|p| p.as_f64()).map(|p| p as f32);

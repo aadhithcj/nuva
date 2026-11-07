@@ -1,15 +1,32 @@
 //! File shelf: drop files, links or text onto the notch; drag them back out anywhere.
 
 use crate::store;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use windows::core::{implement, w, Result, HRESULT, HSTRING};
+use windows_core::Interface;
+use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+use windows::Media::Ocr::OcrEngine;
+use windows::Storage::Streams::DataWriter;
 use windows::Win32::Foundation::{
-    BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HGLOBAL, HWND, POINTL, SIZE, S_OK,
+    BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, GENERIC_READ,
+    GENERIC_WRITE, HGLOBAL, HWND, POINTL, SIZE, S_OK,
 };
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDIBits, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
 };
-use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng,
+    GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGRA, IWICBitmapEncoder,
+    IWICBitmapFrameEncode, IWICBitmapSource, IWICFormatConverter,
+    IWICImagingFactory, IWICStream, WICBitmapDitherTypeNone, WICBitmapEncoderNoCache,
+    WICBitmapInterpolationModeHighQualityCubic, WICBitmapPaletteTypeCustom,
+    WICDecodeMetadataCacheOnDemand,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_MULTITHREADED, IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::*;
@@ -20,6 +37,14 @@ use windows::Win32::UI::Shell::{
     SHParseDisplayName, ShellExecuteW, HDROP, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropAction {
+    Hold,     // 📥 Standard shelf storage
+    Convert,  // 🖼️ PNG <-> JPG WIC conversion
+    Compress, // 🗜️ Pack into .zip archive
+    Ocr,      // 🔍 Extract text via Windows.Media.Ocr
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -104,6 +129,21 @@ impl Shelf {
         self.save();
     }
 
+    pub fn replace_or_add(&mut self, old_path: PathBuf, new_path: PathBuf) {
+        if let Some(it) = self.items.iter_mut().find(|it| it.path == old_path) {
+            it.path = new_path.clone();
+            it.label = file_label(&new_path);
+        } else {
+            self.items.push(Item {
+                kind: Kind::File,
+                label: file_label(&new_path),
+                path: new_path,
+                content: String::new(),
+            });
+        }
+        self.save();
+    }
+
     pub fn add_text(&mut self, text: &str) {
         let text = text.trim();
         if text.is_empty() {
@@ -140,7 +180,6 @@ impl Shelf {
                 let _ = std::fs::remove_file(&it.path);
             }
         }
-        // Remove any stray snippets from previous sessions.
         if let Ok(rd) = std::fs::read_dir(snippet_dir()) {
             for e in rd.flatten() {
                 let _ = std::fs::remove_file(e.path());
@@ -151,100 +190,101 @@ impl Shelf {
 
     pub fn convert_image(&mut self, i: usize) -> Option<PathBuf> {
         if i >= self.items.len() { return None; }
-        let p = &self.items[i].path;
-        let ext = p.extension()?.to_str()?.to_lowercase();
-        let target_ext = if ext == "png" { "jpg" } else { "png" };
-        let out_name = format!("{}_converted.{}", p.file_stem()?.to_str()?, target_ext);
-        let out_path = p.parent()?.join(&out_name);
-
-        let ps_cmd = format!(
-            "Add-Type -AssemblyName System.Drawing; $b = [System.Drawing.Bitmap]::FromFile('{}'); $fmt = if ('{}' -eq 'jpg') {{ [System.Drawing.Imaging.ImageFormat]::Jpeg }} else {{ [System.Drawing.Imaging.ImageFormat]::Png }}; $b.Save('{}', $fmt); $b.Dispose()",
-            p.display(), target_ext, out_path.display()
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-            .status()
-            .ok()?;
-        if status.success() && out_path.exists() {
-            self.items.push(Item {
-                kind: Kind::File,
-                label: file_label(&out_path),
-                path: out_path.clone(),
-                content: String::new(),
-            });
-            self.save();
-            Some(out_path)
-        } else {
-            None
-        }
+        let p = self.items[i].path.clone();
+        convert_image_async(p.clone());
+        Some(p)
     }
 
     pub fn zip_item(&mut self, i: usize) -> Option<PathBuf> {
         if i >= self.items.len() { return None; }
-        let p = &self.items[i].path;
-        let out_name = format!("{}.zip", p.file_stem()?.to_str()?);
-        let out_path = p.parent()?.join(&out_name);
-
-        let ps_cmd = format!(
-            "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-            p.display(), out_path.display()
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-            .status()
-            .ok()?;
-        if status.success() && out_path.exists() {
-            self.items.push(Item {
-                kind: Kind::File,
-                label: file_label(&out_path),
-                path: out_path.clone(),
-                content: String::new(),
-            });
-            self.save();
-            Some(out_path)
-        } else {
-            None
-        }
+        let p = self.items[i].path.clone();
+        compress_files_async(vec![p.clone()]);
+        Some(p)
     }
 
     pub fn open(&self, i: usize) {
-        if let Some(it) = self.items.get(i) {
-            let target = if it.kind == Kind::Link { HSTRING::from(it.content.as_str()) } else { HSTRING::from(it.path.as_os_str()) };
-            unsafe {
-                ShellExecuteW(None, w!("open"), &target, None, None, SW_SHOWNORMAL);
+        self.open_item(i);
+    }
+
+    pub fn open_item(&self, i: usize) {
+        let Some(it) = self.items.get(i) else { return };
+        match it.kind {
+            Kind::Link => {
+                let u: Vec<u16> = it.content.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    let _ = ShellExecuteW(None, w!("open"), windows::core::PCWSTR(u.as_ptr()), None, None, SW_SHOWNORMAL);
+                }
+            }
+            Kind::Text => {
+                crate::app::copy_text(crate::events::target(), &it.content);
+            }
+            Kind::File => {
+                let u: Vec<u16> = it.path.as_os_str().encode_wide().chain(Some(0)).collect();
+                unsafe {
+                    let _ = ShellExecuteW(None, w!("open"), windows::core::PCWSTR(u.as_ptr()), None, None, SW_SHOWNORMAL);
+                }
+            }
+        }
+    }
+}
+
+fn label_for(kind: Kind, p: &Path, content: &str) -> String {
+    match kind {
+        Kind::File => file_label(p),
+        Kind::Link => {
+            let host = content.split("://").nth(1).unwrap_or(content).split('/').next().unwrap_or(content);
+            host.trim_start_matches("www.").to_string()
+        }
+        Kind::Text => {
+            let first = content.lines().next().unwrap_or("Snippet").trim();
+            if first.len() > 28 {
+                format!("{}…", &first[..first.char_indices().nth(27).map(|(i, _)| i).unwrap_or(27)])
+            } else if first.is_empty() {
+                "Snippet".into()
+            } else {
+                first.into()
             }
         }
     }
 }
 
 fn is_url(s: &str) -> bool {
-    !s.contains(char::is_whitespace) && (s.starts_with("http://") || s.starts_with("https://") || s.starts_with("www."))
+    s.starts_with("http://") || s.starts_with("https://")
 }
 
-fn label_for(kind: Kind, path: &Path, content: &str) -> String {
-    match kind {
-        Kind::File => file_label(path),
-        Kind::Link => content.split("://").nth(1).unwrap_or(content).trim_start_matches("www.").to_string(),
-        Kind::Text => content.lines().next().unwrap_or("").chars().take(60).collect(),
-    }
-}
+// ---------------------------------------------------------------- drop handling
 
-// ---------------------------------------------------------------- drop target
-
+#[derive(Clone, Debug)]
 pub enum Dropped {
     Files(Vec<PathBuf>),
     Text(String),
 }
 
-fn fmt(cf: u16) -> FORMATETC {
-    FORMATETC { cfFormat: cf, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 }
+fn url_format() -> u32 {
+    static FMT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let f = FMT.load(std::sync::atomic::Ordering::Relaxed);
+    if f != 0 {
+        return f;
+    }
+    let u = unsafe { RegisterClipboardFormatW(w!("UniformResourceLocatorW")) };
+    FMT.store(u, std::sync::atomic::Ordering::Relaxed);
+    u
 }
 
-fn url_format() -> u16 {
-    unsafe { RegisterClipboardFormatW(w!("UniformResourceLocatorW")) as u16 }
+fn fmt(cf: u32) -> FORMATETC {
+    FORMATETC {
+        cfFormat: cf as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
 }
 
 unsafe fn global_text(h: HGLOBAL) -> String {
+    if h.0.is_null() {
+        return String::new();
+    }
     let p = GlobalLock(h) as *const u16;
     if p.is_null() {
         return String::new();
@@ -259,13 +299,13 @@ unsafe fn global_text(h: HGLOBAL) -> String {
     s
 }
 
-pub fn read_data(d: &IDataObject) -> Option<Dropped> {
+fn read_data(d: &IDataObject) -> Option<Dropped> {
     unsafe {
-        let f = fmt(CF_HDROP.0);
+        let f = fmt(CF_HDROP.0.into());
         if d.QueryGetData(&f) == S_OK {
             if let Ok(mut m) = d.GetData(&f) {
-                let hdrop = HDROP(m.u.hGlobal.0);
-                let n = DragQueryFileW(hdrop, u32::MAX, None);
+                let hdrop = HDROP(m.u.hGlobal.0 as *mut _);
+                let n = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
                 let mut files = Vec::new();
                 for i in 0..n {
                     let len = DragQueryFileW(hdrop, i, None) as usize;
@@ -277,7 +317,7 @@ pub fn read_data(d: &IDataObject) -> Option<Dropped> {
                 return Some(Dropped::Files(files));
             }
         }
-        for cf in [url_format(), CF_UNICODETEXT.0] {
+        for cf in [url_format(), CF_UNICODETEXT.0 as u32] {
             let f = fmt(cf);
             if d.QueryGetData(&f) == S_OK {
                 if let Ok(mut m) = d.GetData(&f) {
@@ -294,7 +334,7 @@ pub fn read_data(d: &IDataObject) -> Option<Dropped> {
 }
 
 fn can_accept(d: &IDataObject) -> bool {
-    unsafe { [CF_HDROP.0, url_format(), CF_UNICODETEXT.0].iter().any(|&cf| d.QueryGetData(&fmt(cf)) == S_OK) }
+    unsafe { [CF_HDROP.0 as u32, url_format(), CF_UNICODETEXT.0 as u32].iter().any(|&cf| d.QueryGetData(&fmt(cf)) == S_OK) }
 }
 
 #[implement(IDropTarget)]
@@ -309,27 +349,44 @@ impl DropTarget {
 }
 
 impl IDropTarget_Impl for DropTarget_Impl {
-    fn DragEnter(&self, d: Option<&IDataObject>, _k: MODIFIERKEYS_FLAGS, _pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
+    fn DragEnter(&self, d: Option<&IDataObject>, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
         let ok = d.map(can_accept).unwrap_or(false);
         self.ok.set(ok);
         unsafe { *eff = if ok { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
         if ok {
-            crate::app::with(|a| a.drag_enter());
+            let has_images = d.and_then(read_data).map(|dropped| match dropped {
+                Dropped::Files(files) => files.iter().any(|p| {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tiff")
+                }),
+                _ => false,
+            }).unwrap_or(false);
+            crate::app::with(|a| {
+                a.drag_has_images = has_images;
+                a.drag_enter();
+                a.drag_over_pt(pt.x, pt.y);
+            });
         }
         Ok(())
     }
-    fn DragOver(&self, _k: MODIFIERKEYS_FLAGS, _pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
+    fn DragOver(&self, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
         unsafe { *eff = if self.ok.get() { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
+        if self.ok.get() {
+            crate::app::with(|a| a.drag_over_pt(pt.x, pt.y));
+        }
         Ok(())
     }
     fn DragLeave(&self) -> Result<()> {
         crate::app::with(|a| a.drag_leave());
         Ok(())
     }
-    fn Drop(&self, d: Option<&IDataObject>, _k: MODIFIERKEYS_FLAGS, _pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
+    fn Drop(&self, d: Option<&IDataObject>, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, eff: *mut DROPEFFECT) -> Result<()> {
         let got = d.and_then(read_data);
         unsafe { *eff = if got.is_some() { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
-        crate::app::with(|a| a.dropped(got));
+        crate::app::with(|a| {
+            a.drag_over_pt(pt.x, pt.y);
+            a.dropped(got);
+        });
         Ok(())
     }
 }
@@ -354,7 +411,6 @@ impl IDropSource_Impl for DropSource_Impl {
     }
 }
 
-/// Start a shell drag of `paths`. Blocks until the drop finishes.
 pub fn drag_out(paths: &[PathBuf]) -> bool {
     unsafe {
         let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
@@ -386,7 +442,6 @@ pub fn drag_out(paths: &[PathBuf]) -> bool {
 
 // ---------------------------------------------------------------- icons
 
-/// Shell icon/thumbnail for a path as premultiplied BGRA pixels.
 pub fn icon_pixels(path: &Path, px: i32) -> Option<(u32, u32, Vec<u8>)> {
     unsafe {
         let f: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None).ok()?;
@@ -394,7 +449,6 @@ pub fn icon_pixels(path: &Path, px: i32) -> Option<(u32, u32, Vec<u8>)> {
         let mut bi = BITMAPINFO::default();
         bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         let dc = GetDC(None);
-        // First call fills in the size.
         GetDIBits(dc, hbmp, 0, 0, None, &mut bi, DIB_RGB_COLORS);
         let (w, h) = (bi.bmiHeader.biWidth.unsigned_abs(), bi.bmiHeader.biHeight.unsigned_abs());
         if w == 0 || h == 0 || w > 1024 || h > 1024 {
@@ -427,6 +481,403 @@ pub fn icon_pixels(path: &Path, px: i32) -> Option<(u32, u32, Vec<u8>)> {
         }
         Some((w, h, buf))
     }
+}
+
+// ---------------------------------------------------------------- WIC image conversion
+
+struct ComGuard(bool);
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+enum ShelfJob {
+    Convert(PathBuf),
+    Ocr(PathBuf),
+    Compress(Vec<PathBuf>),
+}
+
+static SHELF_TX: std::sync::OnceLock<std::sync::mpsc::Sender<ShelfJob>> = std::sync::OnceLock::new();
+
+fn shelf_sender() -> &'static std::sync::mpsc::Sender<ShelfJob> {
+    SHELF_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ShelfJob>();
+        std::thread::Builder::new()
+            .name("shelf_worker".into())
+            .spawn(move || {
+                let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+                let _guard = ComGuard(hr.is_ok());
+
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        ShelfJob::Convert(src_path) => {
+                            match convert_image_wic(&src_path) {
+                                Ok(new_path) => {
+                                    crate::events::push(crate::events::Event::ShelfImageConverted {
+                                        old_path: src_path,
+                                        new_path,
+                                    });
+                                }
+                                Err(e) => {
+                                    crate::events::push(crate::events::Event::ShelfActionFailed(
+                                        format!("Conversion failed: {}", friendly_io_error(&e)),
+                                    ));
+                                }
+                            }
+                        }
+                        ShelfJob::Ocr(file_path) => {
+                            match run_winrt_ocr(&file_path) {
+                                Ok(text) => {
+                                    let trimmed = text.trim().to_string();
+                                    if trimmed.is_empty() {
+                                        crate::events::push(crate::events::Event::ShelfActionFailed(
+                                            "No text detected in image".into(),
+                                        ));
+                                    } else {
+                                        crate::clipboard::set_text(&trimmed);
+                                        crate::events::push(crate::events::Event::ShelfOcrSuccess {
+                                            path: file_path,
+                                            text: trimmed,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::events::push(crate::events::Event::ShelfActionFailed(
+                                        format!("OCR failed: {}", friendly_ocr_error(&e)),
+                                    ));
+                                }
+                            }
+                        }
+                        ShelfJob::Compress(paths) => {
+                            match compress_files_to_zip(&paths) {
+                                Ok(zip_path) => {
+                                    crate::events::push(crate::events::Event::ShelfZipCreated { path: zip_path });
+                                }
+                                Err(e) => {
+                                    crate::events::push(crate::events::Event::ShelfActionFailed(
+                                        format!("ZIP failed: {e}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        tx
+    })
+}
+
+pub fn convert_image_async(src_path: PathBuf) {
+    let _ = shelf_sender().send(ShelfJob::Convert(src_path));
+}
+
+fn friendly_io_error(e: &windows_core::Error) -> String {
+    let code = e.code().0 as u32;
+    match code {
+        0x80070002 => "File not found".into(),
+        0x80070005 => "Access denied".into(),
+        0x80070020 => "File is locked by another process".into(),
+        _ => "Unsupported image format or corrupt file".into(),
+    }
+}
+
+fn friendly_ocr_error(e: &windows_core::Error) -> String {
+    let code = e.code().0 as u32;
+    match code {
+        0x80070002 => "Image file not found".into(),
+        0x80070005 => "Access denied to image file".into(),
+        0x80070020 => "Image file is in use by another application".into(),
+        0x80040154 => "Windows OCR components not installed".into(),
+        _ => "No OCR language pack installed or unreadable format".into(),
+    }
+}
+
+fn convert_image_wic(src: &Path) -> Result<PathBuf> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let to_jpeg = ext == "png";
+    let target_ext = if to_jpeg { "jpg" } else { "png" };
+    let container_format = if to_jpeg {
+        GUID_ContainerFormatJpeg
+    } else {
+        GUID_ContainerFormatPng
+    };
+    let target_pixel_format = if to_jpeg {
+        GUID_WICPixelFormat24bppBGR
+    } else {
+        GUID_WICPixelFormat32bppBGRA
+    };
+
+    let dst = unique_output_path(src, target_ext);
+    let tmp_dst = dst.with_extension(format!("{target_ext}.tmp"));
+
+    let encode_res = (|| unsafe {
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+
+        let src_hstring = HSTRING::from(src.as_os_str());
+        let decoder = factory.CreateDecoderFromFilename(
+            &src_hstring,
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )?;
+
+        let frame_decode = decoder.GetFrame(0)?;
+
+        let bitmap_source: IWICBitmapSource = if to_jpeg {
+            let conv_pre: IWICFormatConverter = factory.CreateFormatConverter()?;
+            conv_pre.Initialize(
+                &frame_decode,
+                &GUID_WICPixelFormat32bppBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )?;
+            let (mut w, mut h) = (0u32, 0u32);
+            conv_pre.GetSize(&mut w, &mut h)?;
+            let mut bgra = vec![0u8; (w * h * 4) as usize];
+            conv_pre.CopyPixels(std::ptr::null(), w * 4, bgra.as_mut_slice())?;
+            // Flatten onto white background so transparent PNGs do not encode as black in JPEG
+            for chunk in bgra.chunks_exact_mut(4) {
+                let a = chunk[3] as u32;
+                if a < 255 {
+                    let inv_a = 255 - a;
+                    chunk[0] = ((chunk[0] as u32 * a + 255 * inv_a) / 255) as u8; // B
+                    chunk[1] = ((chunk[1] as u32 * a + 255 * inv_a) / 255) as u8; // G
+                    chunk[2] = ((chunk[2] as u32 * a + 255 * inv_a) / 255) as u8; // R
+                    chunk[3] = 255;
+                }
+            }
+            let white_bmp = factory.CreateBitmapFromMemory(
+                w,
+                h,
+                &GUID_WICPixelFormat32bppBGRA,
+                w * 4,
+                &bgra,
+            )?;
+            white_bmp.cast()?
+        } else {
+            frame_decode.cast()?
+        };
+
+        let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
+        converter.Initialize(
+            &bitmap_source,
+            &target_pixel_format,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
+
+        let stream: IWICStream = factory.CreateStream()?;
+        let tmp_hstring = HSTRING::from(tmp_dst.as_os_str());
+        stream.InitializeFromFilename(&tmp_hstring, GENERIC_WRITE.0)?;
+
+        let encoder: IWICBitmapEncoder =
+            factory.CreateEncoder(&container_format, std::ptr::null())?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+
+        let mut frame_encode: Option<IWICBitmapFrameEncode> = None;
+        encoder.CreateNewFrame(&mut frame_encode, std::ptr::null_mut())?;
+        let frame_encode = frame_encode.unwrap();
+
+        frame_encode.Initialize(None)?;
+
+        let mut width = 0u32;
+        let mut height = 0u32;
+        converter.GetSize(&mut width, &mut height)?;
+        frame_encode.SetSize(width, height)?;
+
+        let mut actual_format = target_pixel_format;
+        frame_encode.SetPixelFormat(&mut actual_format)?;
+
+        frame_encode.WriteSource(&converter, std::ptr::null())?;
+        frame_encode.Commit()?;
+        encoder.Commit()?;
+        Ok::<(), windows::core::Error>(())
+    })();
+
+    if let Err(e) = encode_res {
+        let _ = std::fs::remove_file(&tmp_dst);
+        return Err(e);
+    }
+
+    if std::fs::rename(&tmp_dst, &dst).is_err() {
+        let _ = std::fs::remove_file(&tmp_dst);
+        return Err(windows::core::Error::from_win32());
+    }
+
+    Ok(dst)
+}
+
+fn unique_output_path(src: &Path, new_ext: &str) -> PathBuf {
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("converted");
+
+    let candidate = parent.join(format!("{stem}.{new_ext}"));
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    for i in 1..1000 {
+        let numbered = parent.join(format!("{stem} ({i}).{new_ext}"));
+        if !numbered.exists() {
+            return numbered;
+        }
+    }
+
+    candidate
+}
+
+// ---------------------------------------------------------------- WinRT OCR
+
+pub fn extract_text_from_image_async(file_path: PathBuf) {
+    let _ = shelf_sender().send(ShelfJob::Ocr(file_path));
+}
+
+fn run_winrt_ocr(path: &Path) -> Result<String> {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _guard = ComGuard(hr.is_ok());
+
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+
+        let path_hstr = HSTRING::from(path.as_os_str());
+        let decoder = factory.CreateDecoderFromFilename(
+            &path_hstr,
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )?;
+        let frame = decoder.GetFrame(0)?;
+
+        let converter: IWICFormatConverter = factory.CreateFormatConverter()?;
+        converter.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
+
+        let mut w = 0u32;
+        let mut h = 0u32;
+        converter.GetSize(&mut w, &mut h)?;
+
+        let source: IWICBitmapSource = if w > 4096 || h > 4096 {
+            let s = 4096.0 / (w.max(h) as f32);
+            let target_w = ((w as f32 * s) as u32).max(1);
+            let target_h = ((h as f32 * s) as u32).max(1);
+            let scaler = factory.CreateBitmapScaler()?;
+            scaler.Initialize(&converter, target_w, target_h, WICBitmapInterpolationModeHighQualityCubic)?;
+            w = target_w;
+            h = target_h;
+            scaler.cast()?
+        } else {
+            converter.cast()?
+        };
+
+        let mut bgra_bytes = vec![0u8; (w * h * 4) as usize];
+        source.CopyPixels(
+            std::ptr::null(),
+            w * 4,
+            bgra_bytes.as_mut_slice(),
+        )?;
+
+        let writer = DataWriter::new()?;
+        writer.WriteBytes(&bgra_bytes)?;
+        let buffer = writer.DetachBuffer()?;
+
+        let software_bm = SoftwareBitmap::CreateCopyFromBuffer(
+            &buffer,
+            BitmapPixelFormat::Bgra8,
+            w as i32,
+            h as i32,
+        )?;
+
+        let engine = OcrEngine::TryCreateFromUserProfileLanguages()?;
+        let result = engine.RecognizeAsync(&software_bm)?.get()?;
+
+        let lines = result.Lines()?;
+        let mut full_text = String::new();
+        for i in 0..lines.Size()? {
+            let line = lines.GetAt(i)?;
+            full_text.push_str(&line.Text()?.to_string());
+            full_text.push('\n');
+        }
+
+        Ok(full_text)
+    }
+}
+
+// ---------------------------------------------------------------- Native ZIP
+
+pub fn compress_files_to_zip(paths: &[PathBuf]) -> std::result::Result<PathBuf, String> {
+    if paths.is_empty() {
+        return Err("No files selected for compression".into());
+    }
+
+    let parent = paths[0].parent().unwrap_or_else(|| Path::new("."));
+    let stem = if paths.len() == 1 {
+        paths[0].file_stem().and_then(|s| s.to_str()).unwrap_or("Archive")
+    } else {
+        "Archive"
+    };
+
+    let base_name = format!("{stem}.zip");
+    let candidate = parent.join(&base_name);
+    let zip_path = if !candidate.exists() {
+        candidate
+    } else {
+        let mut chosen = candidate;
+        for i in 1..1000 {
+            let num = parent.join(format!("{stem} ({i}).zip"));
+            if !num.exists() {
+                chosen = num;
+                break;
+            }
+        }
+        chosen
+    };
+
+    let file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for path in paths {
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            zip.start_file(name, options).map_err(|e| e.to_string())?;
+            let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
+        }
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(zip_path)
+}
+
+pub fn compress_files_async(paths: Vec<PathBuf>) {
+    let _ = shelf_sender().send(ShelfJob::Compress(paths));
 }
 
 pub fn register(hwnd: HWND, target: &IDropTarget) {

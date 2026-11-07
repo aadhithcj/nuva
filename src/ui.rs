@@ -43,12 +43,15 @@ pub enum Action {
     ShelfConvert(usize),
     ShelfZip(usize),
     ShelfExplore(usize),
+    #[allow(dead_code)]
+    SetDropAction(crate::shelf::DropAction),
     // Features: Audio, Mic, Color Picker, Command, Calculator
     ToggleMicMute,
     CycleAudioDevice,
     PickColor,
     OpenCommandPalette,
     CommandRun,
+    CommandConfirm(String),
     CalcInput(&'static str),
     CalcClear,
     CalcBackspace,
@@ -75,4 +78,8 @@ pub enum Action {
     WaterStep(&'static str, i32),
     OpenUrl(&'static str),
     OpenDataFolder,
+    // Page ordering
+    PageMoveUp(usize),
+    PageMoveDown(usize),
+    PageResetOrder,
 }

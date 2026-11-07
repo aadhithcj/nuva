@@ -1,6 +1,6 @@
 //! Drawing for the notch: pill, toasts, alerts and every page.
 
-use crate::app::{App, Page, Pet, View, FLARE, WIN_W};
+use crate::app::{App, Page, View, FLARE, WIN_W};
 use crate::clipboard::ClipData;
 use crate::gfx::{ico, pal, Align, Canvas, Color, Rect, W};
 use crate::pomodoro::Mode;
@@ -39,8 +39,6 @@ impl App {
                     }
                 } else if self.pomo.active(&self.settings) {
                     220.0
-                } else if self.pet != Pet::Off {
-                    190.0
                 } else if self.settings.minimal {
                     128.0
                 } else {
@@ -137,13 +135,8 @@ impl App {
             self.draw_pill_overlays(c, a);
             return;
         }
-        match self.pet {
-            Pet::Off => {
-                let now = time::now();
-                c.text(&time::hm_short(now.minute_of_day(), self.h24), a, 12.5, W::Semi, pal::TEXT, Align::Center);
-            }
-            p => self.draw_mascot(c, a.cx(), cy, p),
-        }
+        let now = time::now();
+        c.text(&time::hm_short(now.minute_of_day(), self.h24), a, 12.5, W::Semi, pal::TEXT, Align::Center);
         self.draw_pill_overlays(c, a);
     }
 
@@ -172,44 +165,18 @@ impl App {
     }
 
     fn eq_bars(&self, c: &Canvas, x: f32, cy: f32) {
-        let col = if self.media.playing { pal::ACCENT } else { pal::FAINT };
-        let hs: [f32; 4] = if self.media.playing { [7.0, 12.0, 9.0, 13.0] } else { [4.0, 4.0, 4.0, 4.0] };
-        for (i, h) in hs.iter().enumerate() {
-            c.rrect(Rect::new(x + i as f32 * 4.5, cy - h / 2.0, 2.5, *h), 1.25, col);
-        }
-    }
-
-    fn draw_mascot(&self, c: &Canvas, cx: f32, cy: f32, p: Pet) {
-        let blink = self.blink_until.is_some();
-        let (l, r) = (cx - 11.0, cx + 11.0);
-        match p {
-            Pet::Dozing => {
-                for x in [l, r] {
-                    c.line(x - 4.0, cy + 1.0, x + 4.0, cy + 1.0, pal::DIM, 2.0);
-                }
-                c.text("z", Rect::new(cx + 22.0, cy - 13.0, 12.0, 12.0), 10.0, W::Semi, pal::DIM, Align::Center);
-                c.text("z", Rect::new(cx + 30.0, cy - 19.0, 12.0, 12.0), 8.0, W::Semi, pal::FAINT, Align::Center);
-            }
-            Pet::Waving => {
-                for x in [l, r] {
-                    c.polyline(&[(x - 4.0, cy + 2.0), (x, cy - 3.0), (x + 4.0, cy + 2.0)], pal::TEXT, 2.0);
-                }
-                // A little hand waving beside the face.
-                let t = (time::utc_ticks() / 10_000 % 600) as f32 / 600.0;
-                let ang = (t * std::f32::consts::TAU).sin() * 0.5;
-                let (hx, hy) = (cx + 28.0, cy + 2.0);
-                c.line(hx, hy + 5.0, hx + 6.0 * ang.sin(), hy - 5.0 * ang.cos(), pal::YELLOW, 3.0);
-            }
-            _ => {
-                for x in [l, r] {
-                    if blink {
-                        c.line(x - 4.0, cy, x + 4.0, cy, pal::TEXT, 2.0);
-                    } else {
-                        c.ellipse(x, cy, 3.6, 5.2, pal::TEXT);
-                        c.circle(x + 1.0, cy - 1.6, 1.1, pal::BLACK);
-                    }
-                }
-            }
+        let col = if self.media.playing {
+            self.media_accent.unwrap_or(pal::ACCENT)
+        } else {
+            pal::FAINT
+        };
+        for (i, &amp) in self.audio_spectrum.iter().enumerate() {
+            let h = if self.media.playing {
+                (4.0 + amp.clamp(0.0, 1.0) * 12.0).clamp(3.0, 15.0)
+            } else {
+                3.5
+            };
+            c.rrect(Rect::new(x + i as f32 * 4.5, cy - h / 2.0, 2.5, h), 1.25, col);
         }
     }
 
@@ -428,7 +395,7 @@ impl App {
         if m.can_seek && m.dur > 0.0 {
             c.hit(Rect::new(x, py - 6.0, w, 16.0), Action::SeekBar);
         }
-        c.bar(bar, frac, pal::CARD_HI, pal::TEXT.a(0.9));
+        c.bar(bar, frac, pal::CARD_HI, self.media_accent.unwrap_or(pal::TEXT.a(0.9)));
         if m.dur > 0.0 {
             c.text(&time::mmss(pos), Rect::new(x, py + 6.0, 60.0, 14.0), 10.0, W::Regular, pal::FAINT, Align::Left);
             c.text(&format!("-{}", time::mmss(m.dur - pos)), Rect::new(x + w - 60.0, py + 6.0, 60.0, 14.0), 10.0, W::Regular, pal::FAINT, Align::Right);
@@ -738,19 +705,48 @@ impl App {
 
     // ------------------------------------------------ shelf
 
+    fn draw_dropzone_action_bar(&self, c: &mut Canvas, r: Rect) {
+        let zones = [
+            (crate::shelf::DropAction::Hold, ico::FOLDER, "Hold", "Add to Shelf", true),
+            (crate::shelf::DropAction::Convert, ico::CONVERT, "Convert", if self.drag_has_images { "PNG ↔ JPG" } else { "Images only" }, self.drag_has_images),
+            (crate::shelf::DropAction::Compress, ico::ZIP, "Compress", "Pack to .zip", true),
+            (crate::shelf::DropAction::Ocr, ico::SEARCH, "Extract OCR", if self.drag_has_images { "Copy Text" } else { "Images only" }, self.drag_has_images),
+        ];
+
+        for (i, (action, icon, title, subtitle, enabled)) in zones.iter().enumerate() {
+            let card = App::dropzone_rect(r, i);
+            let active = self.drop_action_zone == Some(*action);
+
+            let bg = if active { pal::CARD_HI } else { pal::CARD };
+            let stroke_col = if active { pal::ACCENT } else { pal::LINE };
+            let stroke_w = if active { 2.0 } else { 1.0 };
+            let icon_col = if active { pal::ACCENT } else if *enabled { pal::DIM } else { pal::FAINT };
+            let title_col = if active { pal::TEXT } else if *enabled { pal::TEXT.a(0.85) } else { pal::FAINT };
+            let sub_col = if active { pal::ACCENT.a(0.9) } else if *enabled { pal::DIM } else { pal::FAINT };
+
+            c.rrect(card, 12.0, bg);
+            c.rrect_stroke(card, 12.0, stroke_col, stroke_w);
+
+            let icon_y = card.cy() - 28.0;
+            c.icon(*icon, Rect::new(card.x, icon_y, card.w, 24.0), 22.0, icon_col);
+            c.text(title, Rect::new(card.x, icon_y + 28.0, card.w, 20.0), 13.0, W::Semi, title_col, Align::Center);
+            c.text(subtitle, Rect::new(card.x, icon_y + 48.0, card.w, 16.0), 10.5, W::Regular, sub_col, Align::Center);
+        }
+    }
+
     fn draw_shelf(&mut self, c: &mut Canvas, r: Rect) {
+        if self.drag_over {
+            self.draw_dropzone_action_bar(c, r);
+            return;
+        }
         let n = self.shelf.items.len();
-        if n == 0 || self.drag_over {
-            let zone = if n == 0 { r.inset(0.0, 2.0) } else { r.inset(0.0, 2.0) };
-            c.rrect(zone, 16.0, if self.drag_over { pal::ACCENT.a(0.12) } else { pal::CARD });
-            c.rrect_stroke(zone, 16.0, if self.drag_over { pal::ACCENT } else { pal::LINE }, 1.5);
-            let title = if self.drag_over { "Release to add" } else { "Drop files here" };
-            c.icon(ico::FOLDER, Rect::new(zone.x, zone.cy() - 40.0, zone.w, 30.0), 20.0, if self.drag_over { pal::ACCENT } else { pal::DIM });
-            c.text(title, Rect::new(zone.x, zone.cy() - 8.0, zone.w, 22.0), 14.0, W::Semi, pal::TEXT, Align::Center);
+        if n == 0 {
+            let zone = r.inset(0.0, 2.0);
+            c.rrect(zone, 16.0, pal::CARD);
+            c.rrect_stroke(zone, 16.0, pal::LINE, 1.5);
+            c.icon(ico::FOLDER, Rect::new(zone.x, zone.cy() - 40.0, zone.w, 30.0), 20.0, pal::DIM);
+            c.text("Drop files here", Rect::new(zone.x, zone.cy() - 8.0, zone.w, 22.0), 14.0, W::Semi, pal::TEXT, Align::Center);
             c.text("Drag out anytime · click to open or copy", Rect::new(zone.x, zone.cy() + 14.0, zone.w, 18.0), 11.0, W::Regular, pal::DIM, Align::Center);
-            if n == 0 {
-                return;
-            }
             return;
         }
         c.text(&format!("{n} item{}", if n == 1 { "" } else { "s" }), Rect::new(r.x, r.y, 120.0, 20.0), 11.5, W::Medium, pal::DIM, Align::Left);
