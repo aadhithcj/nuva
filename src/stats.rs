@@ -133,12 +133,23 @@ impl Stats {
                         let n = size as usize / std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>() + 1;
                         let mut buf: Vec<PDH_FMT_COUNTERVALUE_ITEM_W> = vec![std::mem::zeroed(); n];
                         if PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &mut size, &mut count, Some(buf.as_mut_ptr())) == 0 {
-                            let total: f64 = buf[..count as usize].iter().map(|i| i.FmtValue.Anonymous.doubleValue).sum();
+                            let count = (count as usize).min(n);
+                            let total: f64 = buf[..count].iter().map(|i| i.FmtValue.Anonymous.doubleValue).sum();
                             push(&mut self.gpu, total.clamp(0.0, 100.0) as f32);
                             self.gpu_ok = true;
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+impl Drop for Stats {
+    fn drop(&mut self) {
+        if let Some((query, _)) = self.pdh.take() {
+            unsafe {
+                let _ = PdhCloseQuery(query);
             }
         }
     }

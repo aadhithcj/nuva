@@ -55,6 +55,7 @@ pub enum Action {
     CalcInput(&'static str),
     CalcClear,
     CalcBackspace,
+    CalcTrig,
     // Clipboard
     ClipCopy(usize),
     ClipRemove(usize),

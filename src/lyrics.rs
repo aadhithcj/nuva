@@ -1,12 +1,16 @@
 //! Synced lyrics from LRCLIB (https://lrclib.net), fetched off the UI thread.
 
 use crate::events::{self, Event};
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::core::HSTRING;
 use windows::Foundation::Uri;
 use windows::Web::Http::HttpClient;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
 const UA: &str = "Nuva/1.2.0 (personal Windows build)";
+
+/// The newest lyrics request; older worker threads drop their result.
+static LATEST_REQ_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct Line {
@@ -96,7 +100,10 @@ pub fn parse_lrc(text: &str) -> Vec<Line> {
             rest = rest[end + 1..].trim_start();
             if let Some((m, s)) = tag.split_once(':') {
                 if let (Ok(m), Ok(s)) = (m.parse::<f64>(), s.parse::<f64>()) {
-                    stamps.push(m * 60.0 + s);
+                    let t = m * 60.0 + s;
+                    if t.is_finite() && t >= 0.0 {
+                        stamps.push(t);
+                    }
                 }
             }
         }
@@ -104,7 +111,7 @@ pub fn parse_lrc(text: &str) -> Vec<Line> {
             out.push(Line { t, text: rest.to_string() });
         }
     }
-    out.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
+    out.sort_by(|a, b| a.t.total_cmp(&b.t));
     out
 }
 
@@ -166,7 +173,7 @@ fn fetch(title: &str, artist: &str, album: &str, dur: f64) -> Option<Lyrics> {
         let dd = if dur > 0.0 && d > 0.0 { (d - dur).abs() } else { 30.0 };
         (if synced { 0.0 } else { 1000.0 }) + dd
     };
-    let best = arr.iter().min_by(|x, y| score(x).partial_cmp(&score(y)).unwrap())?;
+    let best = arr.iter().min_by(|x, y| score(x).total_cmp(&score(y)))?;
     if dur > 0.0 {
         if let Some(d) = best.get("duration").and_then(|d| d.as_f64()) {
             if (d - dur).abs() > 20.0 {
@@ -178,14 +185,51 @@ fn fetch(title: &str, artist: &str, album: &str, dur: f64) -> Option<Lyrics> {
 }
 
 pub fn request(gen: u64, title: String, artist: String, album: String, dur: f64) {
+    LATEST_REQ_ID.store(gen, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("lyrics".into())
         .spawn(move || {
             unsafe {
                 let _ = RoInitialize(RO_INIT_MULTITHREADED);
             }
+            // A newer track was selected while this worker was starting.
+            if LATEST_REQ_ID.load(Ordering::SeqCst) != gen {
+                return;
+            }
             let r = fetch(&title, &artist, &album, dur);
-            events::push(Event::Lyrics(gen, r));
+            // Drop stale responses instead of flashing old lyrics over the new track.
+            if LATEST_REQ_ID.load(Ordering::SeqCst) == gen {
+                events::push(Event::Lyrics(gen, r));
+            }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lrc_sorts_and_drops_invalid_timestamps() {
+        let text = "\
+[00:10.50]second
+[NaN:00.00]not a time
+[00:05.00]first
+[-1:00.00]negative
+[00:05.00]first again";
+        let lines = parse_lrc(text);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text, "first");
+        assert_eq!(lines[1].text, "first again");
+        assert_eq!(lines[2].text, "second");
+        assert!(lines.iter().all(|l| l.t.is_finite() && l.t >= 0.0));
+        assert!(lines.windows(2).all(|w| w[0].t <= w[1].t));
+    }
+
+    #[test]
+    fn lrc_nan_never_panics() {
+        // Before the fix this input made `partial_cmp(...).unwrap()` panic.
+        let lines = parse_lrc("[00:01.00]a\n[NaN:NaN]b\n[00:02.00]c");
+        assert_eq!(lines.len(), 2);
+    }
 }

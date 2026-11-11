@@ -627,39 +627,92 @@ pub fn check_active_downloads() -> Option<crate::events::DownloadInfo> {
 // ---------------------------------------------------------------- live activity pipe
 
 pub fn start_pipe_listener() {
-    std::thread::spawn(|| {
-        unsafe {
-            use windows::Win32::System::Pipes::*;
-            use windows::Win32::Storage::FileSystem::*;
-            let pipe_name = windows::core::w!(r"\\.\pipe\nuva_notch");
-            loop {
-                let pipe = CreateNamedPipeW(
-                    pipe_name,
-                    PIPE_ACCESS_INBOUND,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                    PIPE_UNLIMITED_INSTANCES,
-                    65536,
-                    65536,
-                    0,
-                    None,
-                );
-                if pipe.is_invalid() {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                    continue;
-                }
-                if ConnectNamedPipe(pipe, None).is_ok() {
-                    let mut buf = vec![0u8; 65536];
-                    let mut read = 0u32;
-                    if ReadFile(HANDLE(pipe.0), Some(&mut buf), Some(&mut read), None).is_ok() && read > 0 {
-                        let text = String::from_utf8_lossy(&buf[..read as usize]);
-                        handle_pipe_message(&text);
+    std::thread::Builder::new()
+        .name("nuva_pipe".into())
+        .spawn(|| {
+            unsafe {
+                use windows::Win32::System::Pipes::*;
+                use windows::Win32::Storage::FileSystem::*;
+                let pipe_name = windows::core::w!(r"\\.\pipe\nuva_notch");
+                loop {
+                    let pipe = CreateNamedPipeW(
+                        pipe_name,
+                        PIPE_ACCESS_INBOUND,
+                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                        PIPE_UNLIMITED_INSTANCES,
+                        65536,
+                        65536,
+                        0,
+                        None,
+                    );
+                    if pipe.is_invalid() {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        continue;
                     }
-                    let _ = DisconnectNamedPipe(pipe);
+                    // A fast client may connect before ConnectNamedPipe runs; that is
+                    // reported as ERROR_PIPE_CONNECTED, not a failure.
+                    let connected = ConnectNamedPipe(pipe, None).is_ok()
+                        || windows::Win32::Foundation::GetLastError()
+                            == windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+                    if connected {
+                        // A client can connect without sending anything; never block this
+                        // thread forever. Poll for data, then drain until the client goes idle.
+                        let mut buf = vec![0u8; 65536];
+                        let mut read_total = 0usize;
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let mut last_data = std::time::Instant::now();
+                        loop {
+                            let mut avail = 0u32;
+                            if PeekNamedPipe(pipe, None, 0, None, Some(&mut avail), None).is_err() {
+                                break;
+                            }
+                            if avail == 0 {
+                                // Messages are written in one shot; a short idle gap means done.
+                                if read_total > 0
+                                    && last_data.elapsed() >= std::time::Duration::from_millis(150)
+                                {
+                                    break;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                continue;
+                            }
+                            let remaining = buf.len().saturating_sub(read_total);
+                            if remaining == 0 {
+                                break;
+                            }
+                            let want = (avail as usize).min(remaining);
+                            let mut read = 0u32;
+                            if ReadFile(
+                                HANDLE(pipe.0),
+                                Some(&mut buf[read_total..read_total + want]),
+                                Some(&mut read),
+                                None,
+                            )
+                            .is_err()
+                                || read == 0
+                            {
+                                break;
+                            }
+                            read_total += read as usize;
+                            last_data = std::time::Instant::now();
+                            if read_total >= buf.len() {
+                                break;
+                            }
+                        }
+                        if read_total > 0 {
+                            let text = String::from_utf8_lossy(&buf[..read_total]);
+                            handle_pipe_message(&text);
+                        }
+                        let _ = DisconnectNamedPipe(pipe);
+                    }
+                    let _ = windows::Win32::Foundation::CloseHandle(pipe);
                 }
-                let _ = windows::Win32::Foundation::CloseHandle(pipe);
             }
-        }
-    });
+        })
+        .ok();
 }
 
 fn handle_pipe_message(text: &str) {
@@ -692,8 +745,67 @@ fn handle_pipe_message(text: &str) {
     }
 }
 
-static mut COLOR_HOOK: windows::Win32::UI::WindowsAndMessaging::HHOOK = windows::Win32::UI::WindowsAndMessaging::HHOOK(std::ptr::null_mut());
+static COLOR_HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static COLOR_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Read one screen pixel with BitBlt + GetDIBits (works with hardware-accelerated windows
+/// where GetPixel returns CLR_INVALID).
+pub fn sample_screen_pixel(x: i32, y: i32) -> Option<u32> {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(screen);
+        if mem.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return None;
+        }
+        let bmp = CreateCompatibleBitmap(screen, 1, 1);
+        if bmp.is_invalid() {
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(None, screen);
+            return None;
+        }
+        let old = SelectObject(mem, bmp);
+        let copied = BitBlt(mem, 0, 0, 1, 1, screen, x, y, SRCCOPY).is_ok();
+        let mut pixel = 0u32;
+        if copied {
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = 1;
+            bi.bmiHeader.biHeight = -1;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB.0;
+            let got = GetDIBits(
+                mem,
+                bmp,
+                0,
+                1,
+                Some(&mut pixel as *mut u32 as *mut core::ffi::c_void),
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
+            if got == 0 {
+                pixel = 0;
+            }
+        }
+        let _ = SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+        if !copied {
+            return None;
+        }
+        // DIB memory is B,G,R,A; return the COLORREF-style 0x00BBGGRR the rest of the app expects.
+        let b = (pixel & 0xff) as u32;
+        let g = ((pixel >> 8) & 0xff) as u32;
+        let r = ((pixel >> 16) & 0xff) as u32;
+        Some(r | (g << 8) | (b << 16))
+    }
+}
 
 pub fn start_color_picker(hwnd: windows::Win32::Foundation::HWND) {
     unsafe {
@@ -706,16 +818,18 @@ pub fn start_color_picker(hwnd: windows::Win32::Foundation::HWND) {
             0,
         );
         if let Ok(h) = hook {
-            COLOR_HOOK = h;
+            COLOR_HOOK.store(h.0 as isize, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
 
 pub fn stop_color_picker() {
-    unsafe {
-        if !COLOR_HOOK.0.is_null() {
-            let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(COLOR_HOOK);
-            COLOR_HOOK = windows::Win32::UI::WindowsAndMessaging::HHOOK(std::ptr::null_mut());
+    let raw = COLOR_HOOK.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if raw != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(
+                windows::Win32::UI::WindowsAndMessaging::HHOOK(raw as *mut core::ffi::c_void),
+            );
         }
     }
 }
@@ -726,30 +840,39 @@ unsafe extern "system" fn mouse_color_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::*;
-    use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::Foundation::*;
     if code >= 0 {
         let msg = wparam.0 as u32;
+        let target = COLOR_TARGET.load(std::sync::atomic::Ordering::SeqCst);
         if msg == WM_LBUTTONDOWN {
             let ms = *(lparam.0 as *const MSLLHOOKSTRUCT);
-            let hdc = GetDC(None);
-            let pixel = GetPixel(hdc, ms.pt.x, ms.pt.y);
-            let _ = ReleaseDC(None, hdc);
-            let r = (pixel.0 & 0xff) as u8;
-            let g = ((pixel.0 >> 8) & 0xff) as u8;
-            let b = ((pixel.0 >> 16) & 0xff) as u8;
-            let hex = format!("#{r:02X}{g:02X}{b:02X}");
-            crate::clipboard::set_text(&hex);
-            let target = COLOR_TARGET.load(std::sync::atomic::Ordering::SeqCst);
-            if target != 0 {
-                let _ = PostMessageW(HWND(target as *mut _), events::WM_APP_COLOR_PICKED, WPARAM(pixel.0 as usize), LPARAM(0));
+            if let Some(pixel) = sample_screen_pixel(ms.pt.x, ms.pt.y) {
+                let r = (pixel & 0xff) as u8;
+                let g = ((pixel >> 8) & 0xff) as u8;
+                let b = ((pixel >> 16) & 0xff) as u8;
+                let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                crate::clipboard::set_text(&hex);
+                if target != 0 {
+                    let _ = PostMessageW(HWND(target as *mut _), events::WM_APP_COLOR_PICKED, WPARAM(pixel as usize), LPARAM(0));
+                }
+            } else if target != 0 {
+                let _ = PostMessageW(HWND(target as *mut _), events::WM_APP_COLOR_CANCELED, WPARAM(0), LPARAM(0));
             }
             stop_color_picker();
             return LRESULT(1);
         } else if msg == WM_RBUTTONDOWN {
+            if target != 0 {
+                let _ = PostMessageW(HWND(target as *mut _), events::WM_APP_COLOR_CANCELED, WPARAM(0), LPARAM(0));
+            }
             stop_color_picker();
             return LRESULT(1);
         }
     }
-    CallNextHookEx(COLOR_HOOK, code, wparam, lparam)
+    let hook = COLOR_HOOK.load(std::sync::atomic::Ordering::SeqCst);
+    CallNextHookEx(
+        windows::Win32::UI::WindowsAndMessaging::HHOOK(hook as *mut core::ffi::c_void),
+        code,
+        wparam,
+        lparam,
+    )
 }

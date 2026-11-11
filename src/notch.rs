@@ -787,17 +787,19 @@ impl App {
             if hov {
                 c.icon_button(Rect::new(tile.r() - 22.0, tile.y + 2.0, 20.0, 20.0), ico::CLOSE, 8.0, Action::ShelfRemove(i), pal::DIM);
                 if it.kind == Kind::File {
-                    let mut btn_x = tile.x + 4.0;
-                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::LINK, 8.5, Action::ShelfCopyPath(i), pal::ACCENT);
-                    btn_x += 20.0;
+                    // Keep the action row below the label so it cannot overlap the close button.
+                    let mut btn_x = tile.x + 1.0;
+                    let btn_y = tile.b() - 24.0;
+                    c.icon_button(Rect::new(btn_x, btn_y, 20.0, 20.0), ico::LINK, 8.5, Action::ShelfCopyPath(i), pal::ACCENT);
+                    btn_x += 22.0;
                     let ext = it.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
                     if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp") {
-                        c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::CONVERT, 8.5, Action::ShelfConvert(i), pal::GREEN);
-                        btn_x += 20.0;
+                        c.icon_button(Rect::new(btn_x, btn_y, 20.0, 20.0), ico::CONVERT, 8.5, Action::ShelfConvert(i), pal::GREEN);
+                        btn_x += 22.0;
                     }
-                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::ZIP, 8.5, Action::ShelfZip(i), pal::ACCENT);
-                    btn_x += 20.0;
-                    c.icon_button(Rect::new(btn_x, tile.y + 2.0, 20.0, 20.0), ico::FOLDER, 8.5, Action::ShelfExplore(i), pal::DIM);
+                    c.icon_button(Rect::new(btn_x, btn_y, 20.0, 20.0), ico::ZIP, 8.5, Action::ShelfZip(i), pal::ACCENT);
+                    btn_x += 22.0;
+                    c.icon_button(Rect::new(btn_x, btn_y, 20.0, 20.0), ico::FOLDER, 8.5, Action::ShelfExplore(i), pal::DIM);
                 }
             }
         }
@@ -990,10 +992,10 @@ impl App {
 
         if let Some(res) = &self.cmd.result {
             let res_r = Rect::new(bar.r() - 170.0, bar.y + 6.0, 100.0, 28.0);
-            c.text(&format!("= {}", res.title), res_r, 15.0, W::Bold, pal::ACCENT, Align::Right);
+            c.text(&res.title, res_r, 15.0, W::Bold, pal::ACCENT, Align::Right);
             let btn_r = Rect::new(bar.r() - 64.0, bar.y + 7.0, 56.0, 26.0);
             let btn_lbl = match res.kind {
-                crate::cmd::CommandKind::Copy(_) => "Copy",
+                crate::cmd::CommandKind::Copy(_) | crate::cmd::CommandKind::Calc(..) => "Copy",
                 _ => "Run",
             };
             c.button(btn_r, btn_lbl, Action::CommandRun, pal::ACCENT, pal::BLACK);
@@ -1013,8 +1015,8 @@ impl App {
             [("C", "", "danger"), ("(", "(", "fn"), (")", ")", "fn"), ("^", "^", "op"), ("÷", " / ", "op")],
             [("7", "7", "num"), ("8", "8", "num"), ("9", "9", "num"), ("√", "sqrt(", "fn"), ("×", " * ", "op")],
             [("4", "4", "num"), ("5", "5", "num"), ("6", "6", "num"), ("%", "%", "fn"), ("-", " - ", "op")],
-            [("1", "1", "num"), ("2", "2", "num"), ("3", "3", "num"), ("sin", "sin(", "fn"), ("+", " + ", "op")],
-            [("0", "0", "num"), (".", ".", "num"), ("π", "pi", "fn"), ("cos", "cos(", "fn"), ("=", "", "accent")],
+            [("1", "1", "num"), ("2", "2", "num"), ("3", "3", "num"), ("sin", "", "trig"), ("+", " + ", "op")],
+            [("0", "0", "num"), (".", ".", "num"), ("π", "pi", "fn"), ("Ans", "ans", "fn"), ("=", "", "accent")],
         ];
 
         for (r_idx, row) in grid.iter().enumerate() {
@@ -1028,6 +1030,7 @@ impl App {
                 let (fill, fg, act) = match *kind {
                     "danger" => (pal::RED.a(0.20), pal::RED, Action::CalcClear),
                     "accent" => (pal::ACCENT, pal::BLACK, Action::CommandRun),
+                    "trig" => (pal::CARD, pal::WATER, Action::CalcTrig),
                     "op" => (pal::CARD, pal::ACCENT, Action::CalcInput(val)),
                     "fn" => (pal::CARD, pal::WATER, Action::CalcInput(val)),
                     _ => (pal::CARD_HI, pal::TEXT, Action::CalcInput(val)),

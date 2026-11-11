@@ -2,6 +2,7 @@
 
 use crate::store;
 use crate::time::{self, Now};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Task {
@@ -15,12 +16,13 @@ pub struct Task {
     pub title: String,
     pub fired_start: bool,
     pub fired_end: bool,
-    pub snooze_until: f64,
+    pub snooze_until: Option<Instant>,
 }
 
 impl Task {
+    /// End minute relative to the task's day; may exceed 1440 for tasks crossing midnight.
     pub fn end(&self) -> u32 {
-        self.start + self.dur
+        self.start.saturating_add(self.dur)
     }
 }
 
@@ -55,7 +57,7 @@ impl Todo {
                 fired_start: f[5] == "1",
                 fired_end: f[6] == "1",
                 title: store::unesc(f[7]),
-                snooze_until: 0.0,
+                snooze_until: None,
             });
         }
         // Keep two weeks of history.
@@ -115,7 +117,8 @@ impl Todo {
             t.start = start;
             t.dur = dur;
             t.fired_start = past(day, start);
-            t.fired_end = past(day, start + dur);
+            t.fired_end = past(day, start.saturating_add(dur));
+            t.snooze_until = None;
         } else {
             let id = self.next_id;
             self.next_id += 1;
@@ -127,8 +130,8 @@ impl Todo {
                 done: false,
                 title,
                 fired_start: past(day, start),
-                fired_end: past(day, start + dur),
-                snooze_until: 0.0,
+                fired_end: past(day, start.saturating_add(dur)),
+                snooze_until: None,
             });
         }
         self.save();
@@ -148,7 +151,7 @@ impl Todo {
 
     pub fn snooze(&mut self, id: u64, mins: u32, ev: TaskEvent) {
         if let Some(t) = self.get_mut(id) {
-            t.snooze_until = time::local_secs() + mins as f64 * 60.0;
+            t.snooze_until = Some(Instant::now() + Duration::from_secs(mins as u64 * 60));
             match ev {
                 TaskEvent::Start => t.fired_start = false,
                 TaskEvent::End => t.fired_end = false,
@@ -157,19 +160,34 @@ impl Todo {
     }
 
     pub fn tick(&mut self, now: &Now, on_start: bool, on_end: bool) -> Vec<(u64, TaskEvent)> {
-        let (day, m, secs) = (now.day_num(), now.minute_of_day(), now.secs());
+        let (day, m) = (now.day_num(), now.minute_of_day());
         let mut out = Vec::new();
-        for t in self.tasks.iter_mut().filter(|t| t.day == day && !t.done) {
-            if secs < t.snooze_until {
-                continue;
+        // Tasks from yesterday that run past midnight are still relevant for their end event.
+        for t in self.tasks.iter_mut().filter(|t| {
+            !t.done && (t.day == day || (t.day == day - 1 && t.end() >= 1440))
+        }) {
+            if let Some(until) = t.snooze_until {
+                if Instant::now() < until {
+                    continue;
+                }
+                t.snooze_until = None;
             }
-            if !t.fired_start && m >= t.start {
+            if t.day == day && !t.fired_start && m >= t.start {
                 t.fired_start = true;
                 if on_start && m < t.end().max(t.start + 1) {
                     out.push((t.id, TaskEvent::Start));
                 }
             }
-            if !t.fired_end && t.dur > 0 && m >= t.end() {
+            let end_min = if t.day == day {
+                if t.end() >= 1440 {
+                    // The end reminder fires tomorrow at the wrapped minute.
+                    continue;
+                }
+                t.end()
+            } else {
+                t.end().saturating_sub(1440)
+            };
+            if !t.fired_end && t.dur > 0 && m >= end_min {
                 t.fired_end = true;
                 if on_end {
                     out.push((t.id, TaskEvent::End));

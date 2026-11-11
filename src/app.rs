@@ -22,10 +22,10 @@ use crate::water::{Water, WaterAlert};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, Interface, GUID, HSTRING};
+use windows::core::{w, Interface, GUID, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, ID2D1RenderTarget};
-use windows::Win32::Graphics::Gdi::{CreateRectRgn, MonitorFromPoint, SetWindowRgn, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, ScreenToClient, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::Graphics::Imaging::IWICBitmapSource;
 use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -110,6 +110,39 @@ impl Page {
             Page::Notifs => "Notifications",
             Page::Stats => "System",
             Page::Calc => "Calculator",
+        }
+    }
+
+    /// Stable key used by settings and external CLI tooling.
+    #[allow(dead_code)]
+    pub fn key(self) -> &'static str {
+        match self {
+            Page::Home => "home",
+            Page::Timer => "timer",
+            Page::Water => "water",
+            Page::Todo => "todo",
+            Page::Calendar => "calendar",
+            Page::Shelf => "shelf",
+            Page::Clipboard => "clipboard",
+            Page::Notifs => "notifs",
+            Page::Stats => "stats",
+            Page::Calc => "calc",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Page> {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "home" | "now" => Some(Page::Home),
+            "timer" | "focus" | "pomo" => Some(Page::Timer),
+            "water" | "hydration" => Some(Page::Water),
+            "todo" | "tasks" => Some(Page::Todo),
+            "calendar" | "cal" => Some(Page::Calendar),
+            "shelf" | "files" => Some(Page::Shelf),
+            "clipboard" | "clip" => Some(Page::Clipboard),
+            "notifs" | "notifications" => Some(Page::Notifs),
+            "stats" | "system" => Some(Page::Stats),
+            "calc" | "calculator" | "search" => Some(Page::Calc),
+            _ => None,
         }
     }
 }
@@ -199,7 +232,6 @@ pub struct App {
     last_frame: Instant,
     anim_on: bool,
     dirty: bool,
-    region: (i32, i32, i32),
     hidden: bool,
 
     // interaction
@@ -253,6 +285,7 @@ pub struct App {
     lang_fg: isize,
     last_minute: u32,
     tick_n: u64,
+    slow_n: u64,
     bmp_cache: HashMap<String, ID2D1Bitmap>,
     pub settings_win: Option<SettingsWindow>,
     preview: bool,
@@ -329,7 +362,6 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             last_frame: Instant::now(),
             anim_on: false,
             dirty: true,
-            region: (0, 0, 0),
             hidden: false,
             expanded: false,
             page: Page::Home,
@@ -379,6 +411,7 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             lang_fg: 0,
             last_minute: 99,
             tick_n: 0,
+            slow_n: 0,
             bmp_cache: HashMap::new(),
             settings_win: None,
             preview: false,
@@ -423,11 +456,10 @@ pub fn run(open_settings: bool, preview: Option<String>) {
             app.sr.snap(0.0);
         }
         SetTimer(hwnd, T_TICK, 1000, None);
-        SetTimer(hwnd, T_EDGE_POLL, 25, None);
+        SetTimer(hwnd, T_EDGE_POLL, 80, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         if let Some(p) = preview {
-            let all = [Page::Home, Page::Timer, Page::Water, Page::Todo, Page::Calendar, Page::Shelf, Page::Clipboard, Page::Notifs, Page::Stats, Page::Calc];
-            app.page = all.into_iter().find(|x| x.title().eq_ignore_ascii_case(&p) || format!("{x:?}").eq_ignore_ascii_case(&p) || p.eq_ignore_ascii_case("calc")).unwrap_or(Page::Home);
+            app.page = Page::from_key(&p).unwrap_or(Page::Home);
             if app.page == Page::Calc {
                 app.set_activatable(true);
             }
@@ -533,7 +565,6 @@ impl App {
             self.surf = CompSurface::new(&self.gfx, self.hwnd, w as u32, h as u32).ok();
             self.bmp_cache.clear();
         }
-        self.region = (0, 0, 0);
         self.request_frame();
     }
 
@@ -628,38 +659,11 @@ impl App {
         }
         let ok = unsafe { dc.EndDraw(None, None) }.is_ok() && self.surf.as_ref().map(|s| s.present().is_ok()).unwrap_or(false);
         self.hits = std::mem::take(&mut c.hits);
-        self.update_region();
         if !ok {
             // Device lost: rebuild the surface on the next frame.
             self.surf = None;
             self.bmp_cache.clear();
             self.place_window();
-        }
-    }
-
-    fn update_region(&mut self) {
-        let s = self.scale;
-        let cx = WIN_W / 2.0;
-        let x0 = ((cx - self.sw.v / 2.0 - FLARE) * s).floor() as i32;
-        let x1 = ((cx + self.sw.v / 2.0 + FLARE) * s).ceil() as i32;
-        let h = (self.sh.v * s).ceil() as i32;
-        if h <= 0 {
-            if self.region != (0, 0, 0) {
-                self.region = (0, 0, 0);
-                unsafe {
-                    let rgn = CreateRectRgn(0, 0, 0, 0);
-                    SetWindowRgn(self.hwnd, rgn, true);
-                }
-            }
-            return;
-        }
-        let h = h + 1;
-        if (x0, x1, h) != self.region {
-            self.region = (x0, x1, h);
-            unsafe {
-                let rgn = CreateRectRgn(x0, 0, x1, h);
-                SetWindowRgn(self.hwnd, rgn, true);
-            }
         }
     }
 
@@ -696,6 +700,28 @@ impl App {
             v.push(Page::Home);
         }
         v
+    }
+
+    /// Navigate to a page by identity, not by position in the current page order.
+    pub fn goto_page(&mut self, page: Page) {
+        if page == Page::Home || self.pages().contains(&page) {
+            self.page = page;
+            self.expanded = true;
+            if page == Page::Calc {
+                self.set_activatable(true);
+            }
+            self.request_frame();
+        } else {
+            self.show_toast(
+                ToastKind::Info,
+                ico::INFO,
+                pal::DIM,
+                &format!("{} is disabled", page.title()),
+                "Enable it in Settings → Pages",
+                None,
+                2.0,
+            );
+        }
     }
 
     pub fn view(&self) -> View {
@@ -736,6 +762,21 @@ impl App {
         }
         match msg {
             WM_TIMER => self.on_timer(wp.0),
+            WM_NCHITTEST => {
+                if self.hidden {
+                    return Some(LRESULT(HTTRANSPARENT as isize));
+                }
+                let mut pt = POINT { x: lo(lp.0), y: hi(lp.0) };
+                unsafe {
+                    let _ = ScreenToClient(self.hwnd, &mut pt);
+                }
+                let s = self.scale.max(0.01);
+                let x = pt.x as f32 / s;
+                let y = pt.y as f32 / s;
+                let r = self.notch_rect();
+                let inside = x >= r.x - 2.0 && x <= r.r() + 2.0 && y >= -2.0 && y <= r.b() + 2.0;
+                return Some(LRESULT(if inside { HTCLIENT as isize } else { HTTRANSPARENT as isize }));
+            }
             WM_MOUSEMOVE => self.on_mouse_move(lo(lp.0) as f32 / self.scale, hi(lp.0) as f32 / self.scale),
             WM_MOUSELEAVE => {
                 self.tracking = false;
@@ -821,6 +862,13 @@ impl App {
                 self.picking_color = false;
                 self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Color Copied", &hex, None, 2.5);
                 self.request_frame();
+            }
+            events::WM_APP_COLOR_CANCELED => {
+                if self.picking_color {
+                    self.picking_color = false;
+                    self.show_toast(ToastKind::Notification, ico::CLOSE, pal::DIM, "Color Picker", "Canceled", None, 1.4);
+                    self.request_frame();
+                }
             }
             WM_POWERBROADCAST => {
                 if wp.0 == 0x8013 && lp.0 != 0 {
@@ -997,20 +1045,18 @@ impl App {
 
     fn on_down(&mut self, x: f32, y: f32) {
         if self.picking_color {
+            let mut pt = POINT::default();
             unsafe {
-                let mut pt = windows::Win32::Foundation::POINT::default();
-                if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_ok() {
-                    let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
-                    let pixel = windows::Win32::Graphics::Gdi::GetPixel(hdc, pt.x, pt.y);
-                    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
-                    let r = (pixel.0 & 0xff) as u8;
-                    let g = ((pixel.0 >> 8) & 0xff) as u8;
-                    let b = ((pixel.0 >> 16) & 0xff) as u8;
-                    let hex = format!("#{r:02X}{g:02X}{b:02X}");
-                    crate::clipboard::set_text(&hex);
-                    self.clip.record_text(&hex);
-                    self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Color Copied", &hex, None, 2.5);
-                }
+                let _ = GetCursorPos(&mut pt);
+            }
+            if let Some(pixel) = system::sample_screen_pixel(pt.x, pt.y) {
+                let r = (pixel & 0xff) as u8;
+                let g = ((pixel >> 8) & 0xff) as u8;
+                let b = ((pixel >> 16) & 0xff) as u8;
+                let hex = format!("#{r:02X}{g:02X}{b:02X}");
+                crate::clipboard::set_text(&hex);
+                self.clip.record_text(&hex);
+                self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Color Copied", &hex, None, 2.5);
             }
             self.picking_color = false;
             self.preview_color = None;
@@ -1133,7 +1179,7 @@ impl App {
         if self.picking_color && ch == 27 {
             system::stop_color_picker();
             self.picking_color = false;
-            self.show_toast(ToastKind::Notification, ico::CLOSE, pal::DIM, "Color Picker", "Cancelled", None, 1.5);
+            self.show_toast(ToastKind::Notification, ico::CLOSE, pal::DIM, "Color Picker", "Canceled", None, 1.5);
             self.request_frame();
             return;
         }
@@ -1486,6 +1532,11 @@ impl App {
                 self.cmd.backspace();
                 self.request_frame();
             }
+            Action::CalcTrig => {
+                self.cmd.cycle_trig();
+                self.set_activatable(true);
+                self.request_frame();
+            }
             Action::CommandConfirm(cmd) => {
                 self.cmd.confirm_cmd = Some(cmd);
                 self.cmd.update();
@@ -1500,13 +1551,16 @@ impl App {
                             self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Copied to Clipboard", &s, None, 2.0);
                         }
                         crate::cmd::CommandKind::Launch(cmd) => {
-                            let _ = std::process::Command::new("cmd").args(["/c", "start", "", &cmd]).spawn();
+                            launch_target(&cmd);
                         }
-                        crate::cmd::CommandKind::Page(idx) => {
-                            let pages = self.pages();
-                            if let Some(p) = pages.get(idx) {
-                                self.page = *p;
-                            }
+                        crate::cmd::CommandKind::Calc(value, formatted) => {
+                            self.cmd.ans = value;
+                            crate::clipboard::set_text(&formatted);
+                            self.clip.record_text(&formatted);
+                            self.show_toast(ToastKind::Notification, ico::CHECK, pal::GREEN, "Copied to Clipboard", &formatted, None, 2.0);
+                        }
+                        crate::cmd::CommandKind::Page(page) => {
+                            self.goto_page(page);
                         }
                         crate::cmd::CommandKind::Action(act) => {
                             self.dispatch(act);
@@ -1539,9 +1593,7 @@ impl App {
                 }
             }
             Action::OpenSettings => self.open_settings(),
-            Action::OpenUrl(u) => unsafe {
-                ShellExecuteW(None, w!("open"), &HSTRING::from(u), None, None, SW_SHOWNORMAL);
-            },
+            Action::OpenUrl(u) => launch_target(&u),
             other => {
                 // Settings-window actions routed through the app.
                 crate::settings_window::apply(self, other);
@@ -1605,6 +1657,7 @@ impl App {
 
     fn tick(&mut self) {
         self.tick_n += 1;
+        self.slow_n += 1;
         let now = time::now();
         let mut dirty = false;
 
@@ -1626,9 +1679,6 @@ impl App {
             return;
         }
 
-        // Periodic desktop detection check
-        self.check_desktop_state();
-
         // Stale alerts fall away after two minutes.
         if let Some(a) = self.alerts.front() {
             if a.created.elapsed() > Duration::from_secs(120) {
@@ -1642,7 +1692,8 @@ impl App {
             dirty = true;
         }
 
-        if self.settings.mic_privacy {
+        // Microphone and download probes are comparatively expensive; run them less often.
+        if self.settings.mic_privacy && self.slow_n % 2 == 0 {
             let active = system::mic_in_use();
             let muted = system::mic_muted().unwrap_or(false);
             if active != self.mic_active || muted != self.mic_muted {
@@ -1652,7 +1703,7 @@ impl App {
             }
         }
 
-        if self.settings.downloads {
+        if self.settings.downloads && self.slow_n % 3 == 0 {
             let dl = system::check_active_downloads();
             if dl.is_some() != self.download.is_some() {
                 self.download = dl;
@@ -2009,6 +2060,9 @@ impl App {
             }
             Event::NotifIcon(app, bytes) => {
                 if let Some(src) = self.gfx.decode(&bytes, 64) {
+                    if self.notif_srcs.len() >= 32 && !self.notif_srcs.contains_key(&app) {
+                        self.notif_srcs.clear();
+                    }
                     self.notif_srcs.insert(app, src);
                 }
             }
@@ -2023,7 +2077,8 @@ impl App {
             }
             Event::AudioSpectrum(bands) => {
                 self.audio_spectrum = bands;
-                if self.media.playing {
+                // The equalizer is only drawn in the collapsed pill.
+                if self.media.playing && self.last_view == View::Pill {
                     self.request_frame();
                 }
             }
@@ -2037,11 +2092,7 @@ impl App {
             }
             Event::ShelfOcrSuccess { path: _, text } => {
                 crate::app::copy_text(self.hwnd, &text);
-                let preview = if text.len() > 30 {
-                    format!("{}…", &text[..30])
-                } else {
-                    text
-                };
+                let preview = truncate_chars(&text, 30);
                 self.show_toast(ToastKind::Info, ico::SEARCH, pal::ACCENT, "Text Copied via OCR", &preview, None, 3.0);
             }
             Event::ShelfZipCreated { path } => {
@@ -2218,12 +2269,21 @@ impl App {
 
     // ------------------------------------------------ bitmaps
 
+    fn cache_put(&mut self, key: String, bmp: ID2D1Bitmap) {
+        const MAX_BITMAPS: usize = 96;
+        if self.bmp_cache.len() >= MAX_BITMAPS && !self.bmp_cache.contains_key(&key) {
+            // Album art is always worth keeping; everything else is cheap to rebuild.
+            self.bmp_cache.retain(|k, _| k == "art");
+        }
+        self.bmp_cache.insert(key, bmp);
+    }
+
     pub fn art(&mut self, rt: &ID2D1RenderTarget) -> Option<ID2D1Bitmap> {
         if let Some(b) = self.bmp_cache.get("art") {
             return Some(b.clone());
         }
         let b = crate::gfx::bitmap_from_wic(rt, self.art_src.as_ref()?)?;
-        self.bmp_cache.insert("art".into(), b.clone());
+        self.cache_put("art".into(), b.clone());
         Some(b)
     }
 
@@ -2233,12 +2293,15 @@ impl App {
             return Some(b.clone());
         }
         if !self.shelf_px.contains_key(&key) {
+            if self.shelf_px.len() >= 128 {
+                self.shelf_px.clear();
+            }
             let px = shelf::icon_pixels(path, (48.0 * self.scale) as i32)?;
             self.shelf_px.insert(key.clone(), px);
         }
         let (w, h, px) = self.shelf_px.get(&key)?;
         let b = crate::gfx::bitmap_from_bgra(rt, *w, *h, px)?;
-        self.bmp_cache.insert(key, b.clone());
+        self.cache_put(key, b.clone());
         Some(b)
     }
 
@@ -2250,7 +2313,7 @@ impl App {
         }
         if let crate::clipboard::ClipData::Image { w, h, thumb, .. } = &it.data {
             let b = crate::gfx::bitmap_from_bgra(rt, *w, *h, thumb)?;
-            self.bmp_cache.insert(key, b.clone());
+            self.cache_put(key, b.clone());
             return Some(b);
         }
         None
@@ -2262,7 +2325,7 @@ impl App {
             return Some(b.clone());
         }
         let b = crate::gfx::bitmap_from_wic(rt, self.notif_srcs.get(app)?)?;
-        self.bmp_cache.insert(key, b.clone());
+        self.cache_put(key, b.clone());
         Some(b)
     }
 }
@@ -2273,6 +2336,49 @@ impl Drop for App {
         self.water.save();
         self.todo.save();
     }
+}
+
+/// Split a launcher string into an executable/path and its arguments.
+/// Paths with spaces are only split when the first token is an `.exe`.
+fn split_launch(target: &str) -> (&str, &str) {
+    let t = target.trim();
+    if t.is_empty() || std::path::Path::new(t).exists() {
+        return (t, "");
+    }
+    if let Some(i) = t.find(char::is_whitespace) {
+        let (file, rest) = t.split_at(i);
+        if file.to_ascii_lowercase().ends_with(".exe") {
+            return (file, rest.trim_start());
+        }
+    }
+    (t, "")
+}
+
+/// Launch a file, URL, `.lnk` or executable with arguments without a shell string.
+pub fn launch_target(target: &str) {
+    let (file, params) = split_launch(target);
+    if file.is_empty() {
+        return;
+    }
+    unsafe {
+        let file = HSTRING::from(file);
+        let params = HSTRING::from(params);
+        let params_ptr = PCWSTR(params.as_ptr());
+        let _ = ShellExecuteW(None, w!("open"), &file, params_ptr, None, SW_SHOWNORMAL);
+    }
+}
+
+/// Character-safe truncation for UI previews. Never slices inside a UTF-8 code point.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub fn copy_text(hwnd: HWND, s: &str) {
@@ -2319,5 +2425,28 @@ fn read_clip_text(hwnd: HWND) -> Option<String> {
         })();
         let _ = CloseClipboard();
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncate_chars_never_splits_utf8() {
+        let s = "héllo wörld 🎵 日本語";
+        for n in 0..=s.chars().count() {
+            let out = truncate_chars(s, n);
+            // The output must be valid UTF-8 and at most `n` characters plus an ellipsis.
+            assert!(out.chars().count() <= n + 1);
+            assert!(s.starts_with(out.trim_end_matches('…')));
+        }
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_input() {
+        assert_eq!(truncate_chars("hello", 30), "hello");
+        assert_eq!(truncate_chars("🎵🎵🎵", 2), "🎵🎵…");
+        assert_eq!(truncate_chars("", 5), "");
     }
 }

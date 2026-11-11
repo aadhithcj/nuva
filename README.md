@@ -2,7 +2,7 @@
 
 A living notch for Windows: a black pill at the top of your screen that opens on hover and shows
 music, synced lyrics, timers, reminders, files and more. Native Rust + Direct2D/DirectComposition,
-one ~0.9 MB exe, no web view, no accounts, no tracking. All data stays in your user folder.
+a single self-contained exe (~1.6 MB), no web view, no accounts, no tracking. All data stays in your user folder.
 
 ## Install
 
@@ -37,16 +37,16 @@ New in this build:
 - **4-Zone Dropzone Action Bar**: Dragging files toward the top of your screen expands the notch into 4 interactive drop targets:
   - **Hold**: Instant file shelf storage for reference and drag-out.
   - **Convert**: PNG ↔ JPG in-memory WIC conversion (flattening transparency over white for JPEGs).
-  - **Compress**: Native Deflate multi-file packaging into a `.zip` archive without external tools.
+  - **Compress**: Native Deflate packaging into a `.zip` archive without external tools. Folders are added recursively with depth and symlink guards, duplicate names are disambiguated, and partial archives are removed on failure.
   - **Extract OCR**: 100% offline, on-device WinRT `Windows.Media.Ocr` text extraction directly to your clipboard.
 - **Dynamic Album Art Palette Extraction**: Automatically samples dominant vibrant colors from active music artwork to theme the media visualizer, waveform, and scrubbers, using a 12-bucket hue histogram and HSV value clamping.
 - **5-Band Real-Time Audio Visualizer**: Streams loopback audio from the default Windows render endpoint using a 5-point Goertzel filter bank (65 Hz, 180 Hz, 520 Hz, 1.8 kHz, 5.8 kHz) with fast-attack / slow-release envelope smoothing. Zero idle CPU: capture thread parks on a condition variable when playback stops.
 - **Desktop Auto-Hide & Top-Edge Hover**: Automatically conceals the notch when windows are active, but stays visible on clean desktop screens and reveals instantly when your cursor brushes the top 4 pixels of the display.
-- **Dedicated Calculator Page**: Interactive 5×5 on-screen keypad (`0-9`, `.`, `+`, `-`, `×`, `÷`, `^`, `%`, `√`, `sin/cos/tan`, `π`, `Ans`, `C`, `=`), live equation input with evaluated result (`= 531`), `Ans` variable memory, natural percentage math (`450 + 18%`, `20% of 500`), rapid-click / right-click trig cycling (`sin` → `cos` → `tan`), and direct physical keyboard typing with 1-click copy.
-- **Search & Universal Launcher**: Multi-result Spotlight-style command palette (`/` or `Ctrl+K`) with `↑`/`↓` and `Tab` keyboard navigation. Launch apps from the Start Menu catalogue (`calc`, `notepad`, `wt`, `chrome`, `code`), run system commands with confirmation (`lock`, `sleep`, `restart`, `shutdown`), web search shortcuts (`g <query>`, `yt <query>`, `gh <query>`, `w <query>`), unit conversions (`50 km to mi`, `100 c to f`), date calculations (`days until 25 dec`, `days to new year`), and instant navigation.
+- **Dedicated Calculator Page**: Interactive 5×5 on-screen keypad (`0-9`, `.`, `+`, `-`, `×`, `÷`, `^`, `%`, `√`, a trig key, `π`, `Ans`, `C`, `=`), live equation input with evaluated result (`= 531`), `Ans` variable memory, natural percentage math (`450 + 18%`, `20% of 500`), tap the trig key to cycle `sin` → `cos` → `tan`, and direct physical keyboard typing with 1-click copy.
+- **Search & Universal Launcher**: Spotlight-style command palette (`/` or `Ctrl+K`) with `↑`/`↓` and `Tab` keyboard navigation. Launch apps from the Start Menu catalogue (`notepad`, `wt`, `chrome`, `code`), open the in-app calculator with `calc`, run system commands with confirmation (`lock`, `sleep`, `restart`, `shutdown`), web search shortcuts (`g <query>`, `yt <query>`, `gh <query>`, `w <query>`), unit conversions (`50 km to mi`, `100 c to f`), date calculations (`days until 25 dec`, `days to new year`), and instant navigation.
 - **Input Passthrough Outside Notch Geometry**: Native `WM_NCHITTEST` returning `HTTRANSPARENT` whenever cursor coordinates fall outside the animated spring bounds (`sw.v`, `sh.v` + flare), allowing underlying browser tabs and titlebars to receive clicks seamlessly.
 - **Native WIC Image Conversion**: Zero-process, asynchronous image transcoding on the Shelf via Windows Imaging Component (`IWICImagingFactory`), converting PNG ↔ JPG in under 5 ms with zero PowerShell overhead.
-- **Binary-Safe Image Clipboard Persistence**: Remembers both text and full-fidelity image entries across restarts in `%APPDATA%\Nuva\clipboard_cache\`.
+- **Image Clipboard History**: Keeps text and full-resolution CF_DIB image entries in memory alongside a bounded thumbnail cache (images are capped so a large screenshot burst cannot grow memory without limit). Text history can persist across restarts.
 - **Page Order Changer & Visibility in Settings**: A dedicated "Pages" section in Settings lets you reorder pages with `▲` and `▼` buttons and toggle any page on or off. Disabled pages are completely hidden from the notch's page dots and gestures; active pages strictly follow your custom order. A "Reset Order" button restores defaults at any time.
 - **Download Progress**: Subtle glow progress bar along the notch bottom edge when downloads are active (`.crdownload`, `.part`, `.download`).
 - **Screen Color Picker / Eyedropper**: One click on the eyedropper icon in the top right header lets you click any pixel on any monitor/app to copy its HEX `#RRGGBB` directly to your clipboard and Clipboard History (powered by low-level hook `WH_MOUSE_LL`). Right-click or press Esc to cancel.
@@ -66,7 +66,7 @@ New in this build:
 
 ## Performance & Overhead
 
-- **Idle CPU**: **0.00%** measured via Windows Performance Monitor (`typeperf "\Process(nuva)\% Processor Time"`). When collapsed and idle, no timers or render loops execute; when media is stopped, the audio loopback thread completely parks on a synchronization condition variable.
+- **Idle CPU**: **<0.1%** measured via Windows Performance Monitor (`typeperf "\Process(nuva)\% Processor Time"`). When collapsed and idle there is no render loop, expensive microphone/download probes are throttled, and the audio loopback thread completely parks on a synchronization condition variable when playback stops.
 - **Memory Footprint**: ~15–18 MB working set, trimmed automatically on startup via `SetProcessWorkingSetSize`.
 - **Image Conversion & Shelf Latency**: <5 ms average measured via `std::time::Instant` over 100 consecutive WIC runs (eliminating the 300–800 ms cold-start latency of PowerShell).
 
@@ -85,7 +85,7 @@ New in this build:
 
 ```powershell
 cargo build                      # debug build
-.\target\debug\nuva.exe --preview=search # start expanded on a page (home, lyrics, timer, water, todo, calendar, shelf, clipboard, notifs, stats, calc, search)
+.\target\debug\nuva.exe --preview=calc   # start expanded on a page (home, timer, water, todo, calendar, shelf, clipboard, notifs, stats, calc)
 .\target\debug\nuva.exe --settings       # open the settings window
 ```
 

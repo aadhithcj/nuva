@@ -1,7 +1,7 @@
 //! Focus timer: focus / short break / long break, long break every 4th focus.
 
 use crate::settings::Settings;
-use crate::time::local_secs;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -23,14 +23,15 @@ impl Mode {
 pub struct Pomodoro {
     pub mode: Mode,
     pub running: bool,
-    ends_at: f64,
+    /// Monotonic deadline while running; immune to wall-clock changes.
+    ends_at: Option<Instant>,
     remaining: f64,
     pub done_focus: u32,
 }
 
 impl Pomodoro {
     pub fn new(s: &Settings) -> Self {
-        Pomodoro { mode: Mode::Focus, running: false, ends_at: 0.0, remaining: s.focus as f64 * 60.0, done_focus: 0 }
+        Pomodoro { mode: Mode::Focus, running: false, ends_at: None, remaining: s.focus as f64 * 60.0, done_focus: 0 }
     }
 
     pub fn duration(&self, s: &Settings) -> f64 {
@@ -42,10 +43,9 @@ impl Pomodoro {
     }
 
     pub fn left(&self) -> f64 {
-        if self.running {
-            (self.ends_at - local_secs()).max(0.0)
-        } else {
-            self.remaining
+        match self.ends_at {
+            Some(end) => end.saturating_duration_since(Instant::now()).as_secs_f64(),
+            None => self.remaining,
         }
     }
 
@@ -62,15 +62,17 @@ impl Pomodoro {
     pub fn start_pause(&mut self) {
         if self.running {
             self.remaining = self.left();
+            self.ends_at = None;
             self.running = false;
         } else {
-            self.ends_at = local_secs() + self.remaining;
+            self.ends_at = Some(Instant::now() + Duration::from_secs_f64(self.remaining.max(0.0)));
             self.running = true;
         }
     }
 
     pub fn reset(&mut self, s: &Settings) {
         self.running = false;
+        self.ends_at = None;
         self.remaining = self.duration(s);
     }
 

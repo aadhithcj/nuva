@@ -1,6 +1,7 @@
 //! File shelf: drop files, links or text onto the notch; drag them back out anywhere.
 
 use crate::store;
+use std::collections::HashSet;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use windows::core::{implement, w, Result, HRESULT, HSTRING};
@@ -237,12 +238,16 @@ fn label_for(kind: Kind, p: &Path, content: &str) -> String {
         }
         Kind::Text => {
             let first = content.lines().next().unwrap_or("Snippet").trim();
-            if first.len() > 28 {
-                format!("{}…", &first[..first.char_indices().nth(27).map(|(i, _)| i).unwrap_or(27)])
-            } else if first.is_empty() {
+            if first.is_empty() {
                 "Snippet".into()
             } else {
-                first.into()
+                let mut chars = first.chars();
+                let head: String = chars.by_ref().take(28).collect();
+                if chars.next().is_some() {
+                    format!("{head}…")
+                } else {
+                    head
+                }
             }
         }
     }
@@ -460,7 +465,13 @@ pub fn icon_pixels(path: &Path, px: i32) -> Option<(u32, u32, Vec<u8>)> {
         bi.bmiHeader.biCompression = BI_RGB.0;
         bi.bmiHeader.biHeight = -(h as i32);
         bi.bmiHeader.biPlanes = 1;
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let len = w.checked_mul(h).and_then(|n| n.checked_mul(4))? as usize;
+        if len == 0 || len > 16 * 1024 * 1024 {
+            ReleaseDC(None, dc);
+            let _ = DeleteObject(hbmp);
+            return None;
+        }
+        let mut buf = vec![0u8; len];
         let lines = GetDIBits(dc, hbmp, 0, h, Some(buf.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS);
         ReleaseDC(None, dc);
         let _ = DeleteObject(hbmp);
@@ -645,8 +656,11 @@ fn convert_image_wic(src: &Path) -> Result<PathBuf> {
             )?;
             let (mut w, mut h) = (0u32, 0u32);
             conv_pre.GetSize(&mut w, &mut h)?;
-            let mut bgra = vec![0u8; (w * h * 4) as usize];
-            conv_pre.CopyPixels(std::ptr::null(), w * 4, bgra.as_mut_slice())?;
+            let stride = w.checked_mul(4).ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), "image too large"))?;
+            let len = (stride as usize).checked_mul(h as usize).filter(|n| *n > 0 && *n <= 256 * 1024 * 1024)
+                .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), "image too large"))?;
+            let mut bgra = vec![0u8; len];
+            conv_pre.CopyPixels(std::ptr::null(), stride, bgra.as_mut_slice())?;
             // Flatten onto white background so transparent PNGs do not encode as black in JPEG
             for chunk in bgra.chunks_exact_mut(4) {
                 let a = chunk[3] as u32;
@@ -727,20 +741,26 @@ fn unique_output_path(src: &Path, new_ext: &str) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("converted");
+    unique_path(parent, stem, new_ext)
+}
 
-    let candidate = parent.join(format!("{stem}.{new_ext}"));
+fn unique_path(parent: &Path, stem: &str, ext: &str) -> PathBuf {
+    let candidate = parent.join(format!("{stem}.{ext}"));
     if !candidate.exists() {
         return candidate;
     }
-
-    for i in 1..1000 {
-        let numbered = parent.join(format!("{stem} ({i}).{new_ext}"));
+    for i in 1..10_000 {
+        let numbered = parent.join(format!("{stem} ({i}).{ext}"));
         if !numbered.exists() {
             return numbered;
         }
     }
-
-    candidate
+    // Extremely unlikely fallback; still never returns an existing path.
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!("{stem} ({n}).{ext}"))
 }
 
 // ---------------------------------------------------------------- WinRT OCR
@@ -793,7 +813,12 @@ fn run_winrt_ocr(path: &Path) -> Result<String> {
             converter.cast()?
         };
 
-        let mut bgra_bytes = vec![0u8; (w * h * 4) as usize];
+        let mut bgra_bytes = {
+            let stride = w.checked_mul(4).ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), "image too large"))?;
+            let len = (stride as usize).checked_mul(h as usize).filter(|n| *n > 0 && *n <= 256 * 1024 * 1024)
+                .ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), "image too large"))?;
+            vec![0u8; len]
+        };
         source.CopyPixels(
             std::ptr::null(),
             w * 4,
@@ -828,52 +853,144 @@ fn run_winrt_ocr(path: &Path) -> Result<String> {
 
 // ---------------------------------------------------------------- Native ZIP
 
+const MAX_ZIP_DEPTH: usize = 16;
+
 pub fn compress_files_to_zip(paths: &[PathBuf]) -> std::result::Result<PathBuf, String> {
     if paths.is_empty() {
         return Err("No files selected for compression".into());
     }
 
-    let parent = paths[0].parent().unwrap_or_else(|| Path::new("."));
+    let parent = paths[0]
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let stem = if paths.len() == 1 {
         paths[0].file_stem().and_then(|s| s.to_str()).unwrap_or("Archive")
     } else {
         "Archive"
     };
+    let zip_path = unique_path(parent, stem, "zip");
 
-    let base_name = format!("{stem}.zip");
-    let candidate = parent.join(&base_name);
-    let zip_path = if !candidate.exists() {
-        candidate
-    } else {
-        let mut chosen = candidate;
-        for i in 1..1000 {
-            let num = parent.join(format!("{stem} ({i}).zip"));
-            if !num.exists() {
-                chosen = num;
-                break;
-            }
-        }
-        chosen
-    };
-
-    let file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+    // `create_new` guarantees a concurrent run cannot clobber a fresh archive.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&zip_path)
+        .map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    for path in paths {
-        if path.is_file() {
+    let mut seen: HashSet<String> = HashSet::new();
+    let result = (|| -> std::result::Result<(), String> {
+        for path in paths {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("file");
-            zip.start_file(name, options).map_err(|e| e.to_string())?;
-            let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
+                .unwrap_or("file")
+                .to_string();
+            if path.is_dir() {
+                add_zip_dir(&mut zip, path, &name, &mut seen, 0, options)?;
+            } else if path.is_file() {
+                add_zip_file(&mut zip, path, &name, &mut seen, options)?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // Never leave a half-written archive behind.
+        drop(zip);
+        let _ = std::fs::remove_file(&zip_path);
+        return Err(e);
+    }
+    zip.finish().map_err(|e| {
+        let _ = std::fs::remove_file(&zip_path);
+        e.to_string()
+    })?;
+    Ok(zip_path)
+}
+
+fn add_zip_dir(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    dir: &Path,
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    depth: usize,
+    options: zip::write::SimpleFileOptions,
+) -> std::result::Result<(), String> {
+    if depth > MAX_ZIP_DEPTH {
+        return Err("Folder nesting is too deep to archive".into());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        // Skip symlinks and junctions so a folder cannot pull in an entire drive.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let arc = format!("{prefix}/{name}");
+        if ft.is_dir() {
+            add_zip_dir(zip, &path, &arc, seen, depth + 1, options)?;
+        } else if ft.is_file() {
+            add_zip_file(zip, &path, &arc, seen, options)?;
         }
     }
-    zip.finish().map_err(|e| e.to_string())?;
-    Ok(zip_path)
+    Ok(())
+}
+
+fn add_zip_file(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    path: &Path,
+    name: &str,
+    seen: &mut HashSet<String>,
+    options: zip::write::SimpleFileOptions,
+) -> std::result::Result<(), String> {
+    let name = unique_archive_name(seen, name);
+    zip.start_file(&name, options).map_err(|e| e.to_string())?;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Archive entry names are case-insensitive on Windows; never add the same name twice.
+fn unique_archive_name(seen: &mut HashSet<String>, name: &str) -> String {
+    if seen.insert(name.to_ascii_lowercase()) {
+        return name.to_string();
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+    for i in 1..10_000 {
+        let cand = if ext.is_empty() {
+            format!("{stem} ({i})")
+        } else {
+            format!("{stem} ({i}).{ext}")
+        };
+        let full = if parent.is_empty() { cand } else { format!("{parent}/{cand}") };
+        if seen.insert(full.to_ascii_lowercase()) {
+            return full;
+        }
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let fallback = if ext.is_empty() {
+        format!("{stem} ({n})")
+    } else {
+        format!("{stem} ({n}).{ext}")
+    };
+    if parent.is_empty() {
+        fallback
+    } else {
+        format!("{parent}/{fallback}")
+    }
 }
 
 pub fn compress_files_async(paths: Vec<PathBuf>) {

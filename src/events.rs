@@ -17,6 +17,7 @@ pub const WM_APP_LANGCHECK: u32 = WM_APP + 5;
 pub const WM_APP_VOLUME: u32 = WM_APP + 6;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 7;
 pub const WM_APP_COLOR_PICKED: u32 = WM_APP + 8;
+pub const WM_APP_COLOR_CANCELED: u32 = WM_APP + 9;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

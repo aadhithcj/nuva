@@ -53,6 +53,13 @@ impl Rect {
     pub fn inset(&self, dx: f32, dy: f32) -> Rect {
         Rect::new(self.x + dx, self.y + dy, (self.w - 2.0 * dx).max(0.0), (self.h - 2.0 * dy).max(0.0))
     }
+    pub fn intersect(&self, other: Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let r = self.r().min(other.r());
+        let b = self.b().min(other.b());
+        Rect::new(x, y, (r - x).max(0.0), (b - y).max(0.0))
+    }
     pub fn split_left(&self, w: f32) -> (Rect, Rect) {
         (Rect::new(self.x, self.y, w, self.h), Rect::new(self.x + w, self.y, (self.w - w).max(0.0), self.h))
     }
@@ -322,8 +329,13 @@ impl Gfx {
             }
             let conv = self.wic.CreateFormatConverter().ok()?;
             conv.Initialize(&src, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut).ok()?;
-            let mut buf = vec![0u8; (w * h * 4) as usize];
-            conv.CopyPixels(std::ptr::null(), w * 4, &mut buf).ok()?;
+            let stride = w.checked_mul(4)?;
+            let len = (stride as usize).checked_mul(h as usize)?;
+            if len == 0 || len > 256 * 1024 * 1024 {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            conv.CopyPixels(std::ptr::null(), stride, &mut buf).ok()?;
             Some((w, h, buf))
         }
     }
@@ -335,13 +347,17 @@ pub fn bitmap_from_wic(rt: &ID2D1RenderTarget, src: &IWICBitmapSource) -> Option
 
 /// Create a D2D bitmap from premultiplied BGRA pixels.
 pub fn bitmap_from_bgra(rt: &ID2D1RenderTarget, w: u32, h: u32, px: &[u8]) -> Option<ID2D1Bitmap> {
+    let stride = w.checked_mul(4)?;
+    if w == 0 || h == 0 || px.len() < (stride as usize).checked_mul(h as usize)? {
+        return None;
+    }
     unsafe {
         let props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
             dpiY: 96.0,
         };
-        rt.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(px.as_ptr() as *const _), w * 4, &props).ok()
+        rt.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(px.as_ptr() as *const _), stride, &props).ok()
     }
 }
 
@@ -445,6 +461,7 @@ pub struct Canvas {
     pub hits: Vec<(Rect, Action)>,
     pub mouse: Option<(f32, f32)>,
     pub alpha: f32,
+    clip_stack: Vec<Rect>,
 }
 
 fn cf(c: Color) -> D2D1_COLOR_F {
@@ -458,7 +475,7 @@ fn pt(x: f32, y: f32) -> D2D_POINT_2F {
 impl Canvas {
     pub fn new(rt: ID2D1RenderTarget, gfx: Gfx, mouse: Option<(f32, f32)>) -> Result<Canvas> {
         let brush = unsafe { rt.CreateSolidColorBrush(&cf(pal::WHITE), None)? };
-        Ok(Canvas { rt, gfx, brush, hits: Vec::new(), mouse, alpha: 1.0 })
+        Ok(Canvas { rt, gfx, brush, hits: Vec::new(), mouse, alpha: 1.0, clip_stack: Vec::new() })
     }
 
     fn b(&self, c: Color) -> &ID2D1SolidColorBrush {
@@ -685,11 +702,17 @@ impl Canvas {
         }
     }
 
-    pub fn clip(&self, r: Rect) {
+    pub fn clip(&mut self, r: Rect) {
+        let effective = match self.clip_stack.last() {
+            Some(current) => current.intersect(r),
+            None => r,
+        };
+        self.clip_stack.push(effective);
         unsafe { self.rt.PushAxisAlignedClip(&r.d2d(), D2D1_ANTIALIAS_MODE_ALIASED) };
     }
 
-    pub fn unclip(&self) {
+    pub fn unclip(&mut self) {
+        self.clip_stack.pop();
         unsafe { self.rt.PopAxisAlignedClip() };
     }
 
@@ -700,8 +723,15 @@ impl Canvas {
     }
 
     pub fn hit(&mut self, r: Rect, a: Action) -> bool {
-        self.hits.push((r, a));
-        self.hover(r)
+        let visible = match self.clip_stack.last() {
+            Some(clip) => r.intersect(*clip),
+            None => r,
+        };
+        if visible.w <= 0.0 || visible.h <= 0.0 {
+            return false;
+        }
+        self.hits.push((visible, a));
+        self.hover(visible)
     }
 
     pub fn icon_button(&mut self, r: Rect, g: char, size: f32, a: Action, c: Color) {

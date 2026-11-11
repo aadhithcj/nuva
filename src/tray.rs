@@ -140,6 +140,9 @@ fn data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
 }
 
+/// The icon currently installed in the notification area (owned by us).
+static TRAY_ICON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
 pub fn add(hwnd: HWND) {
     let mut d = data(hwnd);
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -149,8 +152,15 @@ pub fn add(hwnd: HWND) {
         d.szTip[i] = c;
     }
     unsafe {
-        if !Shell_NotifyIconW(NIM_ADD, &d).as_bool() {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+        let installed = Shell_NotifyIconW(NIM_ADD, &d).as_bool()
+            || Shell_NotifyIconW(NIM_MODIFY, &d).as_bool();
+        if installed {
+            let old = TRAY_ICON.swap(d.hIcon.0 as isize, std::sync::atomic::Ordering::SeqCst);
+            if old != 0 && old != d.hIcon.0 as isize {
+                let _ = DestroyIcon(HICON(old as *mut _));
+            }
+        } else if !d.hIcon.is_invalid() {
+            let _ = DestroyIcon(d.hIcon);
         }
     }
 }
@@ -159,6 +169,10 @@ pub fn remove(hwnd: HWND) {
     let d = data(hwnd);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &d);
+        let old = TRAY_ICON.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if old != 0 {
+            let _ = DestroyIcon(HICON(old as *mut _));
+        }
     }
 }
 

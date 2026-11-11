@@ -5,6 +5,8 @@ pub struct CommandPalette {
     pub result: Option<CommandItem>,
     pub active: bool,
     pub confirm_cmd: Option<String>,
+    /// Last result confirmed with Enter; usable in later expressions as `ans`.
+    pub ans: f64,
 }
 
 #[allow(dead_code)]
@@ -19,8 +21,10 @@ pub struct CommandItem {
 #[derive(Clone, Debug)]
 pub enum CommandKind {
     Copy(String),
+    /// A calculator result: the numeric value (stored as `ans`) and its formatted text.
+    Calc(f64, String),
     Launch(String),
-    Page(usize),
+    Page(crate::app::Page),
     Action(crate::ui::Action),
 }
 
@@ -31,6 +35,7 @@ impl CommandPalette {
             result: None,
             active: false,
             confirm_cmd: None,
+            ans: 0.0,
         }
     }
 
@@ -59,6 +64,22 @@ impl CommandPalette {
         self.result = None;
     }
 
+    /// Cycle the trig function at the end of the query: sin -> cos -> tan -> sin.
+    pub fn cycle_trig(&mut self) {
+        for (from, to) in [("sin(", "cos("), ("cos(", "tan("), ("tan(", "sin(")] {
+            if self.query.ends_with(from) {
+                self.query.truncate(self.query.len() - from.len());
+                self.query.push_str(to);
+                self.confirm_cmd = None;
+                self.update();
+                return;
+            }
+        }
+        self.query.push_str("sin(");
+        self.confirm_cmd = None;
+        self.update();
+    }
+
     pub fn update(&mut self) {
         let q = self.query.trim();
         if q.is_empty() {
@@ -79,7 +100,7 @@ impl CommandPalette {
         }
 
         // 3. Try Math Evaluation (e.g. "124 * 1.18", "sqrt(144) + 10")
-        if let Some(res) = eval_math(q) {
+        if let Some(res) = eval_math(q, self.ans) {
             self.result = Some(res);
             return;
         }
@@ -113,22 +134,25 @@ fn urlencoding(s: &str) -> String {
 
 // ---------------------------------------------------------------- math evaluator
 
-fn eval_math(input: &str) -> Option<CommandItem> {
+fn eval_math(input: &str, ans: f64) -> Option<CommandItem> {
     // Check if input looks like math (contains digits and at least one math operator or func)
     let has_digit = input.chars().any(|c| c.is_ascii_digit());
-    if !has_digit { return None; }
-    let s = input.replace(' ', "").to_lowercase();
+    // "20% of 500" is the same as "20% * 500" once spaces are gone.
+    let s = input.replace(' ', "").to_lowercase().replace("%of", "%*");
+    let has_ans = s.contains("ans");
+    if !has_digit && !has_ans { return None; }
     let has_op = s.contains('+') || s.contains('-') || s.contains('*') || s.contains('/')
         || s.contains('^') || s.contains('%') || s.contains("sqrt") || s.contains("sin")
         || s.contains("cos") || s.contains("tan") || s.contains("abs") || s.contains("floor")
-        || s.contains("ceil") || s.contains("pi") || s.contains('(');
-    if !has_op && !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        || s.contains("ceil") || s.contains("pi") || s.contains('(') || has_ans;
+    let bare_number = s.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if !has_op && !bare_number {
         return None;
     }
 
-    let mut parser = Parser::new(&s);
+    let mut parser = Parser::new(&s, ans);
     let val = parser.parse_expr().ok()?;
-    if !parser.is_eof() { return None; }
+    if !parser.is_eof() || !val.is_finite() { return None; }
 
     let formatted = if val.fract().abs() < 1e-9 {
         format!("{}", val as i64)
@@ -142,17 +166,36 @@ fn eval_math(input: &str) -> Option<CommandItem> {
         title: format!("= {}", formatted),
         sub: format!("{input} • Press Enter to copy"),
         icon: crate::gfx::ico::CALCULATOR,
-        kind: CommandKind::Copy(formatted),
+        kind: CommandKind::Calc(val, formatted),
     })
+}
+
+/// A parsed term, remembering whether it was written as a percentage (`10%`).
+#[derive(Clone, Copy)]
+struct Term {
+    value: f64,
+    percent: bool,
+}
+
+impl Term {
+    fn plain(value: f64) -> Term {
+        Term { value, percent: false }
+    }
+
+    /// Value as a plain number: percentages become fractions (`10%` -> `0.1`).
+    fn ratio(self) -> f64 {
+        if self.percent { self.value / 100.0 } else { self.value }
+    }
 }
 
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    ans: f64,
 }
 
 impl<'a> Parser<'a> {
-    fn new(s: &'a str) -> Self {
-        Parser { chars: s.chars().peekable() }
+    fn new(s: &'a str, ans: f64) -> Self {
+        Parser { chars: s.chars().peekable(), ans }
     }
 
     fn is_eof(&mut self) -> bool {
@@ -162,35 +205,48 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Result<f64, ()> {
         let mut a = self.parse_term()?;
         while let Some(&c) = self.chars.peek() {
-            if c == '+' {
+            if c == '+' || c == '-' {
                 self.chars.next();
-                a += self.parse_term()?;
-            } else if c == '-' {
-                self.chars.next();
-                a -= self.parse_term()?;
+                let b = self.parse_term()?;
+                // Natural percentages: 200 + 10% == 220, 200 - 10% == 180.
+                let base = a.ratio();
+                let rhs = if b.percent { base * b.value / 100.0 } else { b.value };
+                a = Term::plain(if c == '+' { base + rhs } else { base - rhs });
             } else {
                 break;
             }
         }
-        Ok(a)
+        Ok(a.ratio())
     }
 
-    fn parse_term(&mut self) -> Result<f64, ()> {
+    fn parse_term(&mut self) -> Result<Term, ()> {
         let mut a = self.parse_power()?;
         while let Some(&c) = self.chars.peek() {
-            if c == '*' {
-                self.chars.next();
-                a *= self.parse_power()?;
-            } else if c == '/' {
+            if c == '*' || c == '/' {
                 self.chars.next();
                 let b = self.parse_power()?;
-                if b.abs() < 1e-12 { return Err(()); }
-                a /= b;
+                let lhs = a.ratio();
+                let rhs = b.ratio();
+                if c == '/' && rhs.abs() < 1e-12 { return Err(()); }
+                a = Term::plain(if c == '*' { lhs * rhs } else { lhs / rhs });
             } else if c == '%' {
                 self.chars.next();
-                let b = self.parse_power()?;
-                if b.abs() < 1e-12 { return Err(()); }
-                a %= b;
+                let starts_factor = self
+                    .chars
+                    .peek()
+                    .map(|c| c.is_ascii_digit() || *c == '.' || *c == '(' || c.is_ascii_alphabetic())
+                    .unwrap_or(false);
+                if starts_factor {
+                    // Explicit modulo, e.g. "10 % 3".
+                    let b = self.parse_power()?;
+                    let lhs = a.ratio();
+                    let rhs = b.ratio();
+                    if rhs.abs() < 1e-12 { return Err(()); }
+                    a = Term::plain(lhs % rhs);
+                } else {
+                    // A trailing percent marker was already handled by `parse_power`.
+                    break;
+                }
             } else {
                 break;
             }
@@ -198,21 +254,35 @@ impl<'a> Parser<'a> {
         Ok(a)
     }
 
-    fn parse_power(&mut self) -> Result<f64, ()> {
-        let a = self.parse_factor()?;
+    fn parse_power(&mut self) -> Result<Term, ()> {
+        let mut a = self.parse_factor()?;
         if let Some(&'^') = self.chars.peek() {
             self.chars.next();
             let b = self.parse_power()?;
-            Ok(a.powf(b))
-        } else {
-            Ok(a)
+            a = Term::plain(a.ratio().powf(b.ratio()));
         }
+        // Postfix percentage: `10%` is a fraction. Leave `%` alone when a factor
+        // follows so `10 % 3` still means modulo.
+        if let Some(&'%') = self.chars.peek() {
+            let mut lookahead = self.chars.clone();
+            lookahead.next();
+            let starts_factor = lookahead
+                .peek()
+                .map(|c| c.is_ascii_digit() || *c == '.' || *c == '(' || c.is_ascii_alphabetic())
+                .unwrap_or(false);
+            if !starts_factor {
+                self.chars.next();
+                a = Term { value: a.value, percent: true };
+            }
+        }
+        Ok(a)
     }
 
-    fn parse_factor(&mut self) -> Result<f64, ()> {
+    fn parse_factor(&mut self) -> Result<Term, ()> {
         if let Some(&'-') = self.chars.peek() {
             self.chars.next();
-            return Ok(-self.parse_factor()?);
+            let v = self.parse_factor()?;
+            return Ok(Term { value: -v.value, percent: v.percent });
         }
         if let Some(&'+') = self.chars.peek() {
             self.chars.next();
@@ -222,7 +292,7 @@ impl<'a> Parser<'a> {
             self.chars.next();
             let v = self.parse_expr()?;
             if self.chars.next() != Some(')') { return Err(()); }
-            return Ok(v);
+            return Ok(Term::plain(v));
         }
 
         // Functions / Constants
@@ -237,20 +307,21 @@ impl<'a> Parser<'a> {
         }
 
         if !name.is_empty() {
-            if name == "pi" { return Ok(std::f64::consts::PI); }
-            if name == "e" { return Ok(std::f64::consts::E); }
+            if name == "pi" { return Ok(Term::plain(std::f64::consts::PI)); }
+            if name == "e" { return Ok(Term::plain(std::f64::consts::E)); }
+            if name == "ans" { return Ok(Term::plain(self.ans)); }
             if let Some(&'(') = self.chars.peek() {
                 self.chars.next();
                 let arg = self.parse_expr()?;
                 if self.chars.next() != Some(')') { return Err(()); }
                 return match name.as_str() {
-                    "sqrt" => if arg >= 0.0 { Ok(arg.sqrt()) } else { Err(()) },
-                    "abs" => Ok(arg.abs()),
-                    "sin" => Ok(arg.sin()),
-                    "cos" => Ok(arg.cos()),
-                    "tan" => Ok(arg.tan()),
-                    "floor" => Ok(arg.floor()),
-                    "ceil" => Ok(arg.ceil()),
+                    "sqrt" => if arg >= 0.0 { Ok(Term::plain(arg.sqrt())) } else { Err(()) },
+                    "abs" => Ok(Term::plain(arg.abs())),
+                    "sin" => Ok(Term::plain(arg.sin())),
+                    "cos" => Ok(Term::plain(arg.cos())),
+                    "tan" => Ok(Term::plain(arg.tan())),
+                    "floor" => Ok(Term::plain(arg.floor())),
+                    "ceil" => Ok(Term::plain(arg.ceil())),
                     _ => Err(()),
                 };
             }
@@ -269,7 +340,7 @@ impl<'a> Parser<'a> {
         }
 
         if let Ok(v) = num_str.parse::<f64>() {
-            Ok(v)
+            Ok(Term::plain(v))
         } else {
             Err(())
         }
@@ -381,7 +452,13 @@ fn eval_command(q: &str, confirm_cmd: Option<&str>) -> Option<CommandItem> {
                 },
             })
         }
-        "calc" | "calculator" => Some(CommandItem {
+        "calc" | "calculator" | "search" => Some(CommandItem {
+            title: "Calculator".into(),
+            sub: "Open the in-app calculator".into(),
+            icon: crate::gfx::ico::CALCULATOR,
+            kind: CommandKind::Page(crate::app::Page::Calc),
+        }),
+        "windows calc" | "calc.exe" => Some(CommandItem {
             title: "Open Windows Calculator".into(),
             sub: "Launch calc.exe".into(),
             icon: crate::gfx::ico::CALCULATOR,
@@ -433,49 +510,55 @@ fn eval_command(q: &str, confirm_cmd: Option<&str>) -> Option<CommandItem> {
             title: "Focus Timer".into(),
             sub: "Switch to Pomodoro timer page".into(),
             icon: crate::gfx::ico::TIMER,
-            kind: CommandKind::Page(1),
+            kind: CommandKind::Page(crate::app::Page::Timer),
         }),
         "water" => Some(CommandItem {
             title: "Water Tracker".into(),
             sub: "Switch to hydration tracker page".into(),
             icon: crate::gfx::ico::DROP,
-            kind: CommandKind::Page(2),
+            kind: CommandKind::Page(crate::app::Page::Water),
         }),
         "todo" | "tasks" => Some(CommandItem {
             title: "To-Do List".into(),
             sub: "Switch to tasks page".into(),
             icon: crate::gfx::ico::CHECKLIST,
-            kind: CommandKind::Page(3),
+            kind: CommandKind::Page(crate::app::Page::Todo),
         }),
         "calendar" | "cal" => Some(CommandItem {
             title: "Calendar".into(),
             sub: "Switch to calendar page".into(),
             icon: crate::gfx::ico::CALENDAR,
-            kind: CommandKind::Page(4),
+            kind: CommandKind::Page(crate::app::Page::Calendar),
         }),
         "shelf" => Some(CommandItem {
             title: "File Shelf".into(),
             sub: "Switch to drag-and-drop shelf".into(),
             icon: crate::gfx::ico::FOLDER,
-            kind: CommandKind::Page(5),
+            kind: CommandKind::Page(crate::app::Page::Shelf),
         }),
         "clipboard" | "clip" => Some(CommandItem {
             title: "Clipboard History".into(),
             sub: "Switch to clipboard history".into(),
             icon: crate::gfx::ico::CLIPBOARD,
-            kind: CommandKind::Page(6),
+            kind: CommandKind::Page(crate::app::Page::Clipboard),
         }),
         "notifs" | "notifications" => Some(CommandItem {
             title: "Notifications".into(),
             sub: "Switch to notification center".into(),
             icon: crate::gfx::ico::BELL,
-            kind: CommandKind::Page(7),
+            kind: CommandKind::Page(crate::app::Page::Notifs),
         }),
         "stats" => Some(CommandItem {
             title: "System Stats".into(),
             sub: "Switch to hardware performance graphs".into(),
             icon: crate::gfx::ico::STATS,
-            kind: CommandKind::Page(8),
+            kind: CommandKind::Page(crate::app::Page::Stats),
+        }),
+        "home" | "now" => Some(CommandItem {
+            title: "Now Playing".into(),
+            sub: "Switch to the home page".into(),
+            icon: crate::gfx::ico::MUSIC,
+            kind: CommandKind::Page(crate::app::Page::Home),
         }),
         _ => {
             // Check indexed Start Menu apps
@@ -509,18 +592,24 @@ fn start_menu_apps() -> &'static [(String, String)] {
             dirs.push(std::path::PathBuf::from(progdata).join(r"Microsoft\Windows\Start Menu\Programs"));
         }
         for dir in dirs {
-            scan_lnk_dir(&dir, &mut apps);
+            scan_lnk_dir(&dir, &mut apps, 0);
         }
+        apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        apps.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+        apps.truncate(500);
         apps
     })
 }
 
-fn scan_lnk_dir(dir: &std::path::Path, apps: &mut Vec<(String, String)>) {
+fn scan_lnk_dir(dir: &std::path::Path, apps: &mut Vec<(String, String)>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            scan_lnk_dir(&p, apps);
+            scan_lnk_dir(&p, apps, depth + 1);
         } else if p.extension().and_then(|e| e.to_str()).unwrap_or("").eq_ignore_ascii_case("lnk") {
             if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                 if !stem.to_lowercase().contains("uninstall") {
@@ -625,39 +714,64 @@ fn month_from_str(s: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn math(input: &str, ans: f64) -> f64 {
+        match eval_math(input, ans).map(|i| i.kind) {
+            Some(CommandKind::Calc(v, _)) => v,
+            other => panic!("expected calculator result for {input:?}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_eval_math_basic() {
-        assert_eq!(eval_math("1 + 2").unwrap().title, "= 3");
-        assert_eq!(eval_math("10 - 4").unwrap().title, "= 6");
-        assert_eq!(eval_math("6 * 7").unwrap().title, "= 42");
-        assert_eq!(eval_math("100 / 4").unwrap().title, "= 25");
-        assert_eq!(eval_math("2 ^ 8").unwrap().title, "= 256");
+        assert_eq!(eval_math("1 + 2", 0.0).unwrap().title, "= 3");
+        assert_eq!(eval_math("10 - 4", 0.0).unwrap().title, "= 6");
+        assert_eq!(eval_math("6 * 7", 0.0).unwrap().title, "= 42");
+        assert_eq!(eval_math("100 / 4", 0.0).unwrap().title, "= 25");
+        assert_eq!(eval_math("2 ^ 8", 0.0).unwrap().title, "= 256");
     }
 
     #[test]
     fn test_eval_math_floating_rounding() {
         // Must round clean without 0.30000000000000004
-        assert_eq!(eval_math("0.1 + 0.2").unwrap().title, "= 0.3");
-        assert_eq!(eval_math("0.05 + 0.05").unwrap().title, "= 0.1");
+        assert_eq!(eval_math("0.1 + 0.2", 0.0).unwrap().title, "= 0.3");
+        assert_eq!(eval_math("0.05 + 0.05", 0.0).unwrap().title, "= 0.1");
     }
 
     #[test]
     fn test_eval_math_functions() {
-        assert_eq!(eval_math("sqrt(144)").unwrap().title, "= 12");
-        assert_eq!(eval_math("abs(-42)").unwrap().title, "= 42");
-        assert_eq!(eval_math("floor(3.9)").unwrap().title, "= 3");
-        assert_eq!(eval_math("ceil(3.1)").unwrap().title, "= 4");
+        assert_eq!(eval_math("sqrt(144)", 0.0).unwrap().title, "= 12");
+        assert_eq!(eval_math("abs(-42)", 0.0).unwrap().title, "= 42");
+        assert_eq!(eval_math("floor(3.9)", 0.0).unwrap().title, "= 3");
+        assert_eq!(eval_math("ceil(3.1)", 0.0).unwrap().title, "= 4");
     }
 
     #[test]
     fn test_eval_math_malformed_no_panics() {
-        assert!(eval_math("10 / 0").is_none());
-        assert!(eval_math("10 % 0").is_none());
-        assert!(eval_math("sqrt(-1)").is_none());
-        assert!(eval_math("((1 + 2)").is_none());
-        assert!(eval_math("10 +* 5").is_none());
-        assert!(eval_math("").is_none());
-        assert!(eval_math("hello world").is_none());
+        assert!(eval_math("10 / 0", 0.0).is_none());
+        assert!(eval_math("10 % 0", 0.0).is_none());
+        assert!(eval_math("sqrt(-1)", 0.0).is_none());
+        assert!(eval_math("((1 + 2)", 0.0).is_none());
+        assert!(eval_math("10 +* 5", 0.0).is_none());
+        assert!(eval_math("", 0.0).is_none());
+        assert!(eval_math("hello world", 0.0).is_none());
+    }
+
+    #[test]
+    fn test_natural_percentages() {
+        assert!((math("200 + 10%", 0.0) - 220.0).abs() < 1e-9);
+        assert!((math("200 - 10%", 0.0) - 180.0).abs() < 1e-9);
+        assert!((math("200 * 10%", 0.0) - 20.0).abs() < 1e-9);
+        assert!((math("200 / 10%", 0.0) - 2000.0).abs() < 1e-9);
+        assert!((math("50%", 0.0) - 0.5).abs() < 1e-9);
+        assert!((math("10 % 3", 0.0) - 1.0).abs() < 1e-9);
+        assert!((math("20% of 500", 0.0) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_ans() {
+        assert!((math("ans * 2", 4.0) - 8.0).abs() < 1e-9);
+        assert!((math("ans + 10%", 200.0) - 220.0).abs() < 1e-9);
+        assert_eq!(eval_math("ans", 12.5).unwrap().title, "= 12.5");
     }
 
     #[test]

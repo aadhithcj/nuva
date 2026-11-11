@@ -8,6 +8,11 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, Global
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 const MAX_ITEMS: usize = 40;
+/// Images cost far more memory than text; keep only a handful of previews.
+const MAX_IMAGES: usize = 8;
+/// Refuse absurd clipboard bitmaps instead of duplicating them into history.
+const MAX_DIB_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DIB_PIXELS: usize = 16 * 1024 * 1024;
 
 pub enum ClipData {
     Text(String),
@@ -86,14 +91,37 @@ impl Clipboard {
         let id = self.next_id;
         self.next_id += 1;
         self.items.insert(0, ClipItem { data, pinned: false, id });
-        // Trim oldest unpinned items.
+        self.trim();
+        self.save();
+        true
+    }
+
+    /// Keep history bounded by both item count and retained image memory.
+    fn trim(&mut self) {
         while self.items.iter().filter(|i| !i.pinned).count() > MAX_ITEMS {
             if let Some(p) = self.items.iter().rposition(|i| !i.pinned) {
                 self.items.remove(p);
+            } else {
+                break;
             }
         }
-        self.save();
-        true
+        while self
+            .items
+            .iter()
+            .filter(|i| !i.pinned && matches!(i.data, ClipData::Image { .. }))
+            .count()
+            > MAX_IMAGES
+        {
+            if let Some(p) = self
+                .items
+                .iter()
+                .rposition(|i| !i.pinned && matches!(i.data, ClipData::Image { .. }))
+            {
+                self.items.remove(p);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn copy(&mut self, i: usize, hwnd: HWND) {
@@ -145,11 +173,7 @@ impl Clipboard {
         let id = self.next_id;
         self.next_id += 1;
         self.items.insert(0, ClipItem { data: ClipData::Text(text.to_string()), pinned: false, id });
-        while self.items.iter().filter(|i| !i.pinned).count() > MAX_ITEMS {
-            if let Some(p) = self.items.iter().rposition(|i| !i.pinned) {
-                self.items.remove(p);
-            }
-        }
+        self.trim();
         self.save();
     }
 }
@@ -161,11 +185,12 @@ pub fn set_text(text: &str) -> bool {
 }
 
 unsafe fn open(hwnd: HWND) -> bool {
-    for _ in 0..5 {
+    // Clipboard owners usually release within a few milliseconds; don't stall the UI thread.
+    for _ in 0..3 {
         if OpenClipboard(hwnd).is_ok() {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::thread::sleep(std::time::Duration::from_millis(8));
     }
     false
 }
@@ -214,11 +239,15 @@ unsafe fn read_clipboard(hwnd: HWND) -> Option<ClipData> {
         }
         if IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok() {
             let g = HGLOBAL(GetClipboardData(CF_DIB.0 as u32).ok()?.0);
+            let size = GlobalSize(g);
+            if size == 0 || size > MAX_DIB_BYTES {
+                return None;
+            }
             let p = GlobalLock(g) as *const u8;
             if p.is_null() {
                 return None;
             }
-            let dib = std::slice::from_raw_parts(p, GlobalSize(g)).to_vec();
+            let dib = std::slice::from_raw_parts(p, size).to_vec();
             let _ = GlobalUnlock(g);
             return dib_thumb(&dib, 160).map(|(w, h, thumb, size)| ClipData::Image { w, h, thumb, dib, size });
         }
@@ -256,20 +285,30 @@ fn dib_thumb(dib: &[u8], max: u32) -> Option<(u32, u32, Vec<u8>, (u32, u32))> {
     let rd32 = |o: usize| i32::from_le_bytes(dib[o..o + 4].try_into().unwrap());
     let rd16 = |o: usize| u16::from_le_bytes(dib[o..o + 2].try_into().unwrap());
     let hsize = rd32(0) as usize;
+    if hsize < 40 {
+        return None;
+    }
     let (w, h) = (rd32(4), rd32(8));
     let bpp = rd16(14) as usize;
     let comp = rd32(16);
     let clr_used = rd32(32) as usize;
-    if w <= 0 || h == 0 || !(bpp == 24 || bpp == 32) {
+    if w <= 0 || h == 0 || !(bpp == 24 || bpp == 32) || !(comp == 0 || comp == 3) {
         return None;
     }
     let (w, top_down, ah) = (w as usize, h < 0, h.unsigned_abs() as usize);
-    let mut off = hsize + clr_used * 4;
-    if comp == 3 && hsize == 40 {
-        off += 12;
+    if w.checked_mul(ah)? > MAX_DIB_PIXELS {
+        return None;
     }
-    let stride = (w * bpp / 8 + 3) & !3;
-    if dib.len() < off + stride * ah {
+    let mut off = hsize;
+    if comp == 3 && hsize == 40 {
+        // BI_BITFIELDS stores three color masks directly after the 40-byte header.
+        off = off.checked_add(12)?;
+    }
+    off = off.checked_add(clr_used.checked_mul(4)?)?;
+    let row = w.checked_mul(bpp / 8)?;
+    let stride = row.checked_add(3)? & !3;
+    let need = stride.checked_mul(ah)?.checked_add(off)?;
+    if dib.len() < need {
         return None;
     }
     let s = (max as f32 / w.max(ah) as f32).min(1.0);
